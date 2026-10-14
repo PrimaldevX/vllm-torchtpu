@@ -75,6 +75,8 @@ def _merge_as_rank(outputs, lses, rank, monkeypatch):
     """The merge as rank `r` sees it: its own head block of the whole answer"""
     group = _FakeGroup(outputs, lses, rank)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    # The reduce-scatter merge; the all-to-all one (on by default) is below.
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
     return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
 
 

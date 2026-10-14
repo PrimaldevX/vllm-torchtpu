@@ -540,3 +540,22 @@ if __name__ == "__main__":
     from absl import app
 
     app.run(main)
+
+
+def test_streamidx_block_sizes_small_bucket():
+    """The small-bucket knobs reach only the MIXED pass of buckets <= 16."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP,
+        _streamidx_block_sizes,
+    )
+
+    default = ((2, 2, 2), (1, 128, 128))
+    assert _streamidx_block_sizes(16, None, None) == default
+    assert _streamidx_block_sizes(16, None, 8) == default
+    assert _streamidx_block_sizes(32, 8, 8) == default
+    assert _streamidx_block_sizes(4096, 8, 8) == default
+    assert _streamidx_block_sizes(16, 8, 4) == ((2, 2, 4), (1, 128, 8))
+    assert _streamidx_block_sizes(8, 4, None) == (
+        (2, 2, STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP),
+        (1, 128, 4),
+    )

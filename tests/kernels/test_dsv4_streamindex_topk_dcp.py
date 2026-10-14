@@ -266,14 +266,14 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed):
+def _dcp_case(dcp_size, seed, q_len=Q_LEN):
     """Records plus the positional args and kwargs of one sharded DCP call."""
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
-    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+    q = (jax.random.normal(kq, (q_len, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
     )
-    weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    weights = jax.random.normal(kw, (q_len, H_IDX), jnp.float32).astype(jnp.bfloat16)
 
     # interleave_size=1: global position g lives on rank g % dcp_size at local
     # index g // dcp_size, so the shards are a strided de-interleave.
@@ -294,7 +294,7 @@ def _dcp_case(dcp_size, seed):
         shards,
         jnp.array([KV_LEN], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
-        jnp.array([0, Q_LEN], jnp.int32),
+        jnp.array([0, q_len], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
     )
     kwargs = dict(

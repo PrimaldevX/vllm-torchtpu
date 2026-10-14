@@ -2472,6 +2472,8 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """
     from vllm_torchtpu import envs
 
+    # Explicit, so it applies whatever the model (see the test below).
+    monkeypatch.setenv("TPU_ROPE_CACHE_ROW_MAJOR", "1")
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
     seen = []
@@ -2498,6 +2500,34 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
     TPUModelRunner._relayout_tables(runner, draft_model)
     assert seen == []
+
+
+def test_rope_cache_row_major_default_steps_aside_for_multimodal(monkeypatch):
+    """The default relayout skips a multimodal model (its vision graphs can
+    take an activation shaped like the rope cache, which the shape-keyed entry
+    pin would then mismatch); an explicit setting still applies."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.tpu_runner import _rope_cache_row_major
+
+    def config(multimodal, language_model_only=False):
+        mm = SimpleNamespace(language_model_only=language_model_only)
+        model_config = SimpleNamespace(
+            is_multimodal_model=multimodal,
+            multimodal_config=mm if multimodal else None,
+        )
+        return SimpleNamespace(model_config=model_config)
+
+    monkeypatch.delenv("TPU_ROPE_CACHE_ROW_MAJOR", raising=False)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    assert _rope_cache_row_major(config(multimodal=False))
+    assert not _rope_cache_row_major(config(multimodal=True))
+    assert _rope_cache_row_major(config(multimodal=True, language_model_only=True))
+
+    monkeypatch.setenv("TPU_ROPE_CACHE_ROW_MAJOR", "1")
+    assert _rope_cache_row_major(config(multimodal=True))
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    assert not _rope_cache_row_major(config(multimodal=False))
 
 
 def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):

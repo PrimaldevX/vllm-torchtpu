@@ -1063,6 +1063,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "skip_empty_decode",
     ),
 )
 def streamindex_topk(
@@ -1091,6 +1092,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    skip_empty_decode: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1150,6 +1152,12 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      skip_empty_decode: when the batch has no decode (q_len 1) sequence --
+        every step under speculative decoding, whose decode rows have q_len
+        gamma + 1 and go to the MIXED pass -- branch at runtime around the two
+        DECODE passes, which would launch over an empty range. Unchunked calls
+        only. The MIXED pass writes the same rows either way, so the result is
+        identical.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1550,14 +1558,26 @@ def streamindex_topk(
             sc_group = None if m == num_chunks - 1 else group_base + m
 
             start = m * chunk_len
-            scores = _scores_for_chunk(
-                passes,
-                m,
-                chunk_starts[m],
-                chunk_len,
-                out_dtype,
-                tc_group,
+            scores_for = functools.partial(
+                _scores_for_chunk,
+                chunk_idx=m,
+                chunk_token_start=chunk_starts[m],
+                chunk_tokens=chunk_len,
+                out_dtype=out_dtype,
+                scheduling_group_id=tc_group,
             )
+            if skip_empty_decode and num_chunks == 1:
+                # The DECODE passes cover [0, distribution[1]); with it empty,
+                # the MIXED pass alone allocates the buffer and writes every row
+                # it would have written behind them.
+                mixed_only = tuple(p for p in passes if p[0]["case"] == MlaCase.MIXED)
+                scores = jax.lax.cond(
+                    distribution[1] > 0,
+                    lambda f=scores_for: f(passes),
+                    lambda f=scores_for, p=mixed_only: f(p),
+                )
+            else:
+                scores = scores_for(passes)
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1653,6 +1673,7 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "a2a_merge",
+        "skip_empty_decode",
     ),
 )
 def streamindex_topk_dcp(
@@ -1678,6 +1699,7 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
+    skip_empty_decode: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1746,6 +1768,7 @@ def streamindex_topk_dcp(
       dcp_axis_name: name of the DCP mesh axis.
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
+      skip_empty_decode: forwarded to `streamindex_topk`; see there.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1809,6 +1832,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            skip_empty_decode=skip_empty_decode,
         )
 
         if a2a_merge:

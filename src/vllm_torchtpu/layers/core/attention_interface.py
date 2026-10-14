@@ -1008,6 +1008,20 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
+def dcp_mla_topk_cap(dcp_size: int) -> int:
+    """`TPU_DCP_MLA_TOPK_CAP` as it applies at `dcp_size`; 0 is uncapped.
+
+    The default (-1) is auto: 512 from DCP16, as #1510 shipped it for GLM-5.2
+    AgentX, and off below. A rank owns ~topk/dcp_size slots, so a cap of 512
+    rarely binds at DCP16 and overflows every row at DCP2 (~30% slower
+    prefill there). An explicit value applies at any DCP size.
+    """
+    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    if topk_cap < 0:
+        return 512 if dcp_size >= 16 else 0
+    return topk_cap
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1154,10 +1168,16 @@ def sparse_mla_attention_dcp(
         owns = jnp.any(topk_idx >= 0, axis=-1)
         topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # Split q / lane-dense lse: the kernel joins q_nope and q_pe in VMEM
+        # (no padded [T, H, 640] concat) and exports f32[T, H] lse directly.
+        split_q_lse = envs.TPU_DCP_MLA_SPLIT_Q_LSE
+        if split_q_lse:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        topk_cap = dcp_mla_topk_cap(dcp_size)
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
@@ -1172,6 +1192,12 @@ def sparse_mla_attention_dcp(
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        # Decode-sized chunks: query tokens per attention grid step.
+        small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
+        if small_chunk_batch < 1:
+            raise ValueError(
+                f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
+            )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1188,7 +1214,10 @@ def sparse_mla_attention_dcp(
             # Ranks own ~topk/dcp of each row: a static top-k width with an
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
+            # Decode chunks: tokens per grid step (1 = kernel default).
+            small_chunk_batch_size=small_chunk_batch,
             **chunk_kwargs,
+            **split_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

@@ -249,3 +249,87 @@ def test_route_hash_table_scales_by_the_layer_factor():
     )
     assert ids.tolist() == [[2, 3], [0, 1]]
     torch.testing.assert_close(weights, torch.full((2, 2), 0.5))
+
+
+def test_router_topk_bias_env_defaults_on(monkeypatch):
+    import vllm_torchtpu.envs as envs
+
+    getter = envs.environment_variables["TPU_MOE_ROUTER_TOPK_BIAS"]
+    monkeypatch.delenv("TPU_MOE_ROUTER_TOPK_BIAS", raising=False)
+    assert getter() is True
+    monkeypatch.setenv("TPU_MOE_ROUTER_TOPK_BIAS", "0")
+    assert getter() is False
+
+
+def _bias_inputs(rows, device):
+    import torch
+
+    g = torch.Generator().manual_seed(rows)
+    logits = torch.randn(rows, 256, generator=g) * 2.0
+    bias = torch.randn(256, generator=g) * 0.1
+    # Ties: row 0 all equal; row 1 biased ties with differing unbiased scores.
+    logits[0] = 0.0
+    if rows > 1:
+        logits[1] = torch.linspace(-3.0, 3.0, 256)
+    return logits.to(device), bias.to(device)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("tpu", marks=pytest.mark.tpu_test)]
+)
+@pytest.mark.parametrize("rows", [16, 4096])
+def test_select_experts_bias_in_kernel_is_bit_identical(monkeypatch, device, rows):
+    """TPU_MOE_ROUTER_TOPK_BIAS=1 vs 0 on the GLM-5.2 router shape (256
+    experts, top-8, sigmoid, bias, renormalize, scaling 2.5)."""
+    torch = pytest.importorskip("torch")
+    if device == "tpu":
+        pytest.importorskip("torch_tpu")
+    logits, bias = _bias_inputs(rows, device)
+    layer = _routing_layer(topk=8)
+    layer.scoring_func = "sigmoid"
+    layer.routed_scaling_factor = 2.5
+    hidden = torch.randn(rows, 8, dtype=torch.bfloat16).to(device)
+    # A zero bias makes every tie in the scores a tie in the selection.
+    for bias_t in (bias, torch.zeros_like(bias)):
+        layer.e_score_correction_bias = bias_t
+
+        def run():
+            return moe_routing.select_experts(
+                hidden_states=hidden,
+                router_logits=logits,
+                topk=8,
+                renormalize=True,
+                scoring_fn="sigmoid",
+                layer=layer,
+            )
+
+        monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+        monkeypatch.setattr(moe_routing, "_ROUTER_TOPK_BIAS", False)
+        ref_w, ref_i = (t.cpu() for t in run())
+        monkeypatch.setattr(moe_routing, "_ROUTER_TOPK_BIAS", True)
+        got_w, got_i = (t.cpu() for t in run())
+        assert torch.equal(got_i, ref_i)
+        assert torch.equal(got_w.view(torch.int16), ref_w.view(torch.int16))
+
+
+@pytest.mark.tpu_test
+def test_router_topk_bias_kernel_on_device_matches_gather():
+    """The Pallas kernel itself (not the bridge), on TPU, f32 weights."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch_tpu")
+    from vllm_torchtpu.layers.adapter.router_topk import (
+        rowmax_select,
+        rowmax_select_bias,
+    )
+
+    for rows in (16, 17, 4096):
+        logits, bias = _bias_inputs(rows, "cpu")
+        scores = logits.sigmoid()
+        if rows > 1:
+            bias[:128] = -scores[1, :128]  # biased ties, differing unbiased
+        s_d, b_d = scores.to("tpu"), bias.to("tpu")
+        _, ref_i = rowmax_select(s_d + b_d.view(1, -1), 8)
+        ref_w = s_d.gather(-1, ref_i.long())
+        got_w, got_i = rowmax_select_bias(s_d, b_d, 8)
+        assert torch.equal(got_i.cpu(), ref_i.cpu())
+        assert torch.equal(got_w.cpu().view(torch.int32), ref_w.cpu().view(torch.int32))

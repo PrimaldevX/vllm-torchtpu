@@ -26,9 +26,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
 case "${BRANCH}" in
-  main)
+  main | */main)
     DATE_TAG="nightly-${DATE}"
     LATEST_TAG="latest"
+    ;;
+  glm-agentx | */glm-agentx)
+    DATE_TAG="${DATE}-glm-agentx"
+    LATEST_TAG="glm-agentx-latest"
     ;;
   release/*)
     VERSION="${BRANCH#release/}"

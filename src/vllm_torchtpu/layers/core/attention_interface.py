@@ -1185,7 +1185,10 @@ def sparse_mla_attention_dcp(
         ):
             topk_cap = None
         chunk_kwargs = (
-            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+            {
+                "gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+                "capped_live_rows": envs.TPU_SPARSE_MLA_LIVE_GATHER,
+            }
             if topk_cap
             else {}
         )
@@ -1209,6 +1212,9 @@ def sparse_mla_attention_dcp(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             return_lse=True,
+            # This entry point already rejects dcp_size <= 1, so every row here
+            # is a shard of a global top-k and most of it is "-1" padding.
+            is_dcp_mode=True,
             # The kernel defaults to tensorcore; the caches follow the spec.
             cache_layout=cache_layout,
             # Ranks own ~topk/dcp of each row: a static top-k width with an

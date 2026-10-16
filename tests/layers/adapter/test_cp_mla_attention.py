@@ -148,6 +148,63 @@ def test_projecting_before_the_merge_matches_projecting_after(dcp_size, monkeypa
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "rs_bf16, is_backbone, want",
+    [
+        (True, True, torch.bfloat16),
+        (True, False, torch.float32),
+        (False, True, torch.float32),
+    ],
+)
+def test_a_projected_partial_crosses_in_the_wire_dtype(
+    rs_bf16, is_backbone, want, monkeypatch
+):
+    """A W_UV-projected partial is f32, but the backbone's bf16 reduce-scatter
+    must stay bf16: the caller names the wire dtype. The drafter stays f32."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    outputs, lses = _partials(np.random.default_rng(12), 4)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone, wire_dtype=torch.bfloat16
+    )
+    assert seen == [want]
+    assert got.dtype == torch.float32
+
+
+def test_a_narrow_projection_is_the_f32_projection_rounded_once():
+    """bf16 out is one rounding of the exact projection, not a bf16 dot of
+    rounded operands; the scaled path still projects in f32 first."""
+    rng = np.random.default_rng(23)
+    partial = torch.from_numpy(rng.standard_normal((5, 4, 64)).astype(np.float32))
+    partial = partial.to(torch.bfloat16)
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((4, 64, 16)) / 8).astype(np.float32)
+    ).to(torch.bfloat16)
+    exact = cp_mla.project_uv_heads(partial, w_uv, None)
+    narrow = cp_mla.project_uv_heads(partial, w_uv, None, out_dtype=torch.bfloat16)
+    assert exact.dtype == torch.float32 and narrow.dtype == torch.bfloat16
+    exact64 = exact.double().numpy()
+    err = np.abs(narrow.double().numpy() - exact64)
+    assert (err <= 2.0**-8 * np.abs(exact64) + 1e-6).all()
+
+    scale = torch.from_numpy(rng.uniform(0.5, 2.0, (4, 1, 16)).astype(np.float32))
+    scaled = cp_mla.project_uv_heads(partial, w_uv, scale, out_dtype=torch.bfloat16)
+    assert scaled.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        scaled, cp_mla.project_uv_heads(partial, w_uv, scale).to(torch.bfloat16)
+    )
+
+
 def test_projection_applies_the_per_head_output_scale():
     rng = np.random.default_rng(11)
     partial = torch.from_numpy(rng.standard_normal((3, 4, 16)).astype(np.float32))
@@ -158,6 +215,93 @@ def test_projection_applies_the_per_head_output_scale():
         cp_mla.project_uv_heads(partial, w_uv * scale, None).numpy(),
         rtol=1e-5,
         atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
+    """TPU_DCP_RS_OUT_PRECISION rounds the terms to the output dtype before the
+    reduce-scatter; off, they cross in f32. The result keeps the output dtype."""
+    monkeypatch.setattr(
+        cp_mla.envs,
+        "TPU_DCP_RS_OUT_PRECISION",
+        enabled,
+        raising=False,
+    )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    outputs, lses = _partials(np.random.default_rng(5), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0])
+    assert seen == [torch.bfloat16 if enabled else torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
+def test_rs_bf16_flag_leaves_the_drafter_in_f32(monkeypatch):
+    """The MTP drafter (is_backbone=False) keeps the f32 reduce-scatter even
+    with TPU_DCP_RS_OUT_PRECISION on."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", True, raising=False)
+    outputs, lses = _partials(np.random.default_rng(6), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=False
+    )
+    assert seen == [torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
+def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
+    """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
+    with the flag at its default, the merge passes rs_dtype=bf16."""
+    monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    dcp, heads, kv_lora_rank = 16, 64, 512
+    outputs, lses = _partials(
+        np.random.default_rng(52),
+        dcp,
+        tokens=4,
+        local_heads=heads // dcp,
+        vdim=kv_lora_rank,
+    )
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 3)
+    seen = []
+    real = cp_mla.cp_lse_ag_out_rs
+
+    def spy(output, lse, grp, **kwargs):
+        seen.append(kwargs.get("rs_dtype"))
+        return real(output, lse, grp, **kwargs)
+
+    monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", spy)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(outputs[3], lses[3])
+    assert seen == [torch.bfloat16]
+    assert got.dtype == torch.bfloat16
+    assert tuple(got.shape) == (4, heads // dcp, kv_lora_rank)
+    np.testing.assert_allclose(
+        got.float().numpy(),
+        _reference_merge(outputs.float(), lses)[:, 12:16],
+        rtol=2e-2,
+        atol=2e-2,
     )
 
 
@@ -314,15 +458,23 @@ class _A2AGroup:
         return recv
 
 
-def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
+def _a2a_merge_whole(
+    outputs, lses, monkeypatch, wrong_destination=False, send_dtype=None, sent=None
+):
     """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
-    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+
+    def exchange(x, group):
+        if sent is not None:
+            sent.append(x.dtype)
+        return group.all_to_all(x)
+
+    monkeypatch.setattr(cp_mla, "_all_to_all", exchange)
     world = outputs.shape[0]
     hub = _ExchangeHub(world, wrong_destination)
 
     def run(rank):
         return cp_mla.merge_lse_partials_all_to_all(
-            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+            outputs[rank], lses[rank], _A2AGroup(hub, rank), send_dtype=send_dtype
         )
 
     with concurrent.futures.ThreadPoolExecutor(world) as pool:
@@ -433,7 +585,7 @@ def test_merge_picks_the_all_to_all(
     monkeypatch.setattr(
         cp_mla,
         "merge_lse_partials_all_to_all",
-        lambda o, lse, g: calls.append(o.shape[0]) or o[:, :2],
+        lambda o, lse, g, **kw: calls.append(o.shape[0]) or o[:, :2],
     )
     outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
     group = _FakeGroup(outputs, lses, 0)
@@ -442,6 +594,64 @@ def test_merge_picks_the_all_to_all(
         outputs[0], lses[0], is_backbone=is_backbone
     )
     assert calls == ([tokens] if expect_a2a else [])
+
+
+@pytest.mark.parametrize(
+    "rs_bf16, is_backbone, want",
+    [
+        (True, True, torch.bfloat16),
+        (False, True, None),
+    ],
+)
+def test_the_all_to_all_takes_the_wire_dtype(rs_bf16, is_backbone, want, monkeypatch):
+    """With the all-to-all on, a W_UV-projected f32 partial crosses in the
+    attention dtype exactly when the reduce-scatter would."""
+    seen = []
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", True)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(
+        cp_mla,
+        "merge_lse_partials_all_to_all",
+        lambda o, lse, g, send_dtype=None: seen.append(send_dtype) or o[:, :2],
+    )
+    outputs, lses = _partials(np.random.default_rng(21), 2, tokens=8, vdim=4)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _FakeGroup(outputs, lses, 0))
+    cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone, wire_dtype=torch.bfloat16
+    )
+    assert seen == [want]
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_a_projected_all_to_all_merge_in_bf16_matches_the_reference(
+    dcp_size, monkeypatch
+):
+    """bf16 on the wire rounds each projected partial once, so the merge stays
+    within half a bf16 ulp of the largest term; f32 on the wire stays exact."""
+    rng = np.random.default_rng(20261015)
+    outputs, lses = _hard_partials(rng, dcp_size, vdim=32)
+    heads = outputs.shape[2]
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((heads, 32, 16)) / 32**0.5).astype(np.float32)
+    )
+    projected = torch.stack(
+        [cp_mla.project_uv_heads(outputs[r], w_uv, None) for r in range(dcp_size)]
+    )
+    reference = _reference_merge(projected.double(), lses)
+    term_max = projected.double().abs().amax(dim=0).numpy()
+
+    sent = []
+    got = _a2a_merge_whole(
+        projected, lses, monkeypatch, send_dtype=torch.bfloat16, sent=sent
+    )
+    assert got.dtype == torch.float32
+    assert set(sent) == {torch.bfloat16, torch.float32}  # partial bf16, lse f32
+    err = np.abs(got.double().numpy() - reference)
+    assert (err <= 2.0**-8 * term_max + 1e-6).all()
+    assert (got[3] == 0).all()
+
+    exact = _a2a_merge_whole(projected, lses, monkeypatch)
+    np.testing.assert_allclose(exact.double().numpy(), reference, rtol=1e-5, atol=1e-5)
 
 
 # ===================================================================== #

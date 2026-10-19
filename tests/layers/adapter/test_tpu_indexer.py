@@ -555,3 +555,22 @@ def test_streamidx_block_sizes_small_bucket():
     assert sizes(8, 4, None, 16) == ((2, 2, default_bkvp), (1, 128, 4))
     assert sizes(32, 4, None, 32) == ((2, 2, default_bkvp), (1, 128, 4))
     assert sizes(64, 4, 8, 32) == default
+
+
+def test_streamidx_block_sizes_mixed_kv_pages():
+    """TPU_STREAMIDX_MIXED_KV_PAGES sets the MIXED kv pages of non-small buckets
+    only."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP,
+        _streamidx_block_sizes,
+    )
+
+    default = ((2, 2, 2), (1, 128, 128))
+    assert _streamidx_block_sizes(4096, 4, None, 64, None) == default
+    assert _streamidx_block_sizes(4096, 4, None, 64, 4) == ((2, 2, 4), (1, 128, 128))
+    assert _streamidx_block_sizes(128, None, None, 16, 4) == ((2, 2, 4), (1, 128, 128))
+    # The small-bucket pass keeps its own kv block.
+    assert _streamidx_block_sizes(64, 4, None, 64, 4) == (
+        (2, 2, STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP),
+        (1, 128, 4),
+    )

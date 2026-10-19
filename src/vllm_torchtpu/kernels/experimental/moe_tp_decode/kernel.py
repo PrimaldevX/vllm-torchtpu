@@ -30,6 +30,14 @@ inside the kernel, so no XLA all-reduce follows:
 
 Rows >= n_valid come out exactly +0; n_valid also picks the all-reduce path,
 which sets how many rows travel (all_reduce: zero, fold, trim, full).
+
+Expert range (EP x TP weights, e.g. TPU_MOE_EP_TP_SIZE): a rank may hold only
+the experts [experts_start, experts_start + local) of the E the router scores,
+each at an I-column TP slice. Routing still runs over all E columns; only the
+local experts are compacted, and a ring item is one (expert, _I_CHUNK-column
+chunk of I) pair: the gate and up chunks of w13 and the matching w2 rows, so
+VMEM per slot is the TP16 slot whatever I is. The all-reduce still sums every
+rank, so each rank's partial covers its experts x its columns.
 """
 
 import functools
@@ -64,6 +72,8 @@ _Q_BLOCK = 512
 # Weight ring depth. One slot holds the expert whose first matmul is in
 # flight, so num_buffers - 2 transfers run ahead of compute.
 _NUM_BUFFERS = 6
+# Intermediate columns per ring item (one MXU-wide gate and up chunk).
+_I_CHUNK = 128
 
 
 def exact_in_bf16(value: float) -> bool:
@@ -72,9 +82,15 @@ def exact_in_bf16(value: float) -> bool:
     return float(rounded) == float(value)
 
 
+def _i_chunk(i):
+    """Intermediate columns per ring item for a rank holding I = i."""
+    return min(i, _I_CHUNK)
+
+
 def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
-    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded."""
+    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
+    `i` is the ring item's column count (_i_chunk of the rank's I)."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     f32, bf16 = jnp.float32, jnp.bfloat16
@@ -100,11 +116,15 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     return need, min(limit, info.vmem_capacity_bytes)
 
 
-def kernel_name(experts, m, h, i, shared_inter, n_ranks) -> str:
-    return (
+def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts=None) -> str:
+    name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
         f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
     )
+    if num_experts is not None and num_experts != experts:
+        # Expert range: `experts` of the router's num_experts.
+        name += f"-ne_{num_experts}"
+    return name
 
 
 def can_use_moe_tp_decode(
@@ -142,7 +162,9 @@ def can_use_moe_tp_decode(
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
     if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
         return False
-    if bias.shape != (num_experts,) or experts != num_experts:
+    # This rank's experts are a linear block of the router's num_experts
+    # (experts == num_experts under plain TP).
+    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
         return False
     if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
         return False
@@ -165,7 +187,8 @@ def can_use_moe_tp_decode(
     if not all_reduce.supported(n_ranks, m, h, info):
         return False
     spec = all_reduce.make_spec(n_ranks, m, h)
-    return _vmem_plan(m, h, i, num_experts, shared_inter, info, spec) is not None
+    plan = _vmem_plan(m, h, _i_chunk(i), num_experts, shared_inter, info, spec)
+    return plan is not None
 
 
 def _route(scores, bias, n_valid, *, topk):
@@ -273,16 +296,21 @@ def _kernel(
     hit_sem,
     *ar_scr,
     local_experts,
+    n_chunks,
     topk,
     routed_scale,
     ar_spec,
 ):
     all_reduce.prologue(ar_spec)
     m, h = x_ref.shape
-    i = w2_hbm.shape[1]
+    i = w2_hbm.shape[1]  # this rank's I
+    ic = w2_ref.shape[1]  # columns per ring item; i == ic * n_chunks
+    nc = n_chunks
     nb = _NUM_BUFFERS
     n_valid = meta_ref[0]
     rank = meta_ref[1]
+    # First global expert this rank holds (0 under plain TP).
+    e0 = meta_ref[2]
 
     # The shared slice does not depend on routing: load it first.
     shared_copies = (
@@ -302,6 +330,8 @@ def _kernel(
     hit_copy.wait()
 
     def transfers(step):
+        if nc > 1:
+            return chunk_transfers(step)
         # Active expert `step`'s weights and scales into ring slot step % nb.
         e, slot = active_ids_ref[step], step % nb
         return [
@@ -315,23 +345,53 @@ def _kernel(
             ),
         ]
 
+    def chunk_transfers(step):
+        # Ring item `step` is chunk step % nc of active expert step // nc:
+        # w13's gate and up column chunks side by side, the matching w2 rows,
+        # their scales, and the expert's w2 scale.
+        e = active_ids_ref[lax.div(step, nc)]
+        c0 = pl.multiple_of(lax.rem(step, nc) * ic, ic)
+        slot = step % nb
+        sem = ring_sem.at[slot]
+        lo, hi = pl.ds(0, ic), pl.ds(ic, ic)
+        gate, up = pl.ds(c0, ic), pl.ds(i + c0, ic)
+        return [
+            pltpu.make_async_copy(
+                w1_hbm.at[e, :, gate], w1_ref.at[slot, :, lo], sem.at[0]
+            ),
+            pltpu.make_async_copy(
+                w1_hbm.at[e, :, up], w1_ref.at[slot, :, hi], sem.at[1]
+            ),
+            pltpu.make_async_copy(w2_hbm.at[e, gate], w2_ref.at[slot], sem.at[2]),
+            pltpu.make_async_copy(
+                s1_hbm.at[e, 0, :, gate], s1_ref.at[slot, :, lo], sem.at[3]
+            ),
+            pltpu.make_async_copy(
+                s1_hbm.at[e, 0, :, up], s1_ref.at[slot, :, hi], sem.at[4]
+            ),
+            pltpu.make_async_copy(s2_hbm.at[e, 0], s2_ref.at[slot], sem.at[5]),
+        ]
+
     def compact(e, count):
         # Appends expert e to active_ids_ref if any row picked it. The store
         # is unconditional, so the loop body has no branch: count <= e, a
         # later hit overwrites the entry, and no read touches one >= count.
-        hit = hits_s_ref[0, e] != 0
+        # Local expert e is global column e0 + e.
+        hit = hits_s_ref[0, e0 + e] != 0
         active_ids_ref[count] = e
         return count + hit.astype(jnp.int32)
 
     count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
+    # Ring items, nc per active expert.
+    items = count * nc
 
     def prime(step):
-        @pl.when(step < count)
+        @pl.when(step < items)
         def start():
             for copy in transfers(step):
                 copy.start()
 
-    # The first nb active experts start their weight copies.
+    # The first nb ring items start their weight copies.
     for s in range(nb):
         prime(jnp.int32(s))
 
@@ -360,29 +420,29 @@ def _kernel(
         # w1, rounded to bf16, times its x block's scales and then the weight
         # scales in bf16, summed in bf16 (moe_dense_expert's pattern).
         w_scale = s1_ref[slot].astype(jnp.bfloat16)
-        acc = jnp.zeros((m, 2 * i), jnp.bfloat16)
+        acc = jnp.zeros((m, 2 * ic), jnp.bfloat16)
         for k in range(0, h, _Q_BLOCK):
             part = jnp.matmul(
                 xq_ref[:, k : k + _Q_BLOCK],
                 w1_ref[slot, k : k + _Q_BLOCK, :],
                 preferred_element_type=jnp.float32,
             ).astype(jnp.bfloat16)
-            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * i // lanes), axis=1)
+            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * ic // lanes), axis=1)
             part *= w_scale
             acc += part
         return acc
 
     def finish(step, slot, acc1):
-        e = active_ids_ref[step]
-        # Each row's routing weight for expert e (column e of the routing
-        # table, 0 for rows that did not pick it).
+        e = active_ids_ref[lax.div(step, nc)] if nc > 1 else active_ids_ref[step]
+        # Each row's routing weight for expert e (global column e0 + e of the
+        # routing table, 0 for rows that did not pick it).
         coeff = jnp.sum(
-            jnp.where(expert_columns == e, wtab_ref[...], 0.0),
+            jnp.where(expert_columns == e0 + e, wtab_ref[...], 0.0),
             axis=1,
             keepdims=True,
         )
         # gmm_v2's fused SiLU, on the bf16 gate_up result.
-        act = jax.nn.silu(acc1[:, :i]) * acc1[:, i:]
+        act = jax.nn.silu(acc1[:, :ic]) * acc1[:, ic:]
         # Mask, not multiply: a padded row with non-finite hidden would give
         # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
         mid = jnp.where(coeff != 0, act.astype(jnp.float32) * coeff, 0.0)
@@ -398,7 +458,7 @@ def _kernel(
                 acc2 * s2_ref[slot, :, n : n + _N_CHUNK] * ms
             )
 
-    @pl.when(count > 0)
+    @pl.when(items > 0)
     def run_experts():
         # The prime loop after the compaction started the first nb experts'
         # copies.
@@ -408,7 +468,7 @@ def _kernel(
         def expert_body(step, acc1):
             nxt = step + 1
 
-            @pl.when(nxt < count)
+            @pl.when(nxt < items)
             def wait_next():
                 for copy in transfers(nxt):
                     copy.wait()
@@ -420,14 +480,14 @@ def _kernel(
             finish(step, step % nb, acc1)
 
             # This expert's slot is free once its second matmul has read it.
-            @pl.when(step + nb < count)
+            @pl.when(step + nb < items)
             def refill():
                 for copy in transfers(step + nb):
                     copy.start()
 
             return acc1_next
 
-        lax.fori_loop(0, count, expert_body, gate_up(0))
+        lax.fori_loop(0, items, expert_body, gate_up(0))
 
     # Outside pl.when(count > 0): every rank must take part in the exchange
     # (its peers wait for its chunks), consume the barrier signals sent at
@@ -457,6 +517,7 @@ def moe_tp_decode(
     shared_s13,
     shared_w2,
     shared_s2,
+    experts_start=0,
     *,
     routed_scale: float,
     topk: int,
@@ -471,11 +532,14 @@ def moe_tp_decode(
       n_valid: int32 scalar, rows [0, n_valid) are real tokens; the same on
         every rank.
       rank: int32 scalar, this device's index in the 1-D mesh of n_ranks.
-      w13, w2: [E, D, 2I] / [E, I, D] fp8, this rank's columns of every
-        routed expert ([gate | up] for w13).
-      s13, s2: [E, 1, 1, 2I] / [E, 1, 1, D] f32 per-output-channel scales.
+      w13, w2: [El, D, 2I] / [El, I, D] fp8, this rank's columns of routed
+        experts [experts_start, experts_start + El) ([gate | up] for w13);
+        El == E under plain TP.
+      s13, s2: [El, 1, 1, 2I] / [El, 1, 1, D] f32 per-output-channel scales.
       shared_w13, shared_w2: [D, 2Fs] / [Fs, D] fp8, this rank's slice of the
         shared expert; shared_s13, shared_s2: [2Fs] / [D] f32 scales.
+      experts_start: int32 scalar, the global id of this rank's first expert
+        (runtime data, so every rank compiles the same program).
       routed_scale: routed_scaling_factor, exact in bf16.
       topk: experts per token.
       n_ranks: TP ranks.
@@ -496,7 +560,8 @@ def moe_tp_decode(
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
     ar_spec = all_reduce.make_spec(n_ranks, m, h)
-    plan = _vmem_plan(m, h, i, num_experts, shared_inter, info, ar_spec)
+    ic = _i_chunk(i)
+    plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, ar_spec)
     if plan is None:
         raise ValueError("moe_tp_decode does not fit VMEM; check can_use_moe_tp_decode")
     _, limit = plan
@@ -513,6 +578,7 @@ def moe_tp_decode(
         [
             jnp.asarray(n_valid, jnp.int32).reshape(()),
             jnp.asarray(rank, jnp.int32).reshape(()),
+            jnp.asarray(experts_start, jnp.int32).reshape(()),
         ]
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -521,6 +587,7 @@ def moe_tp_decode(
         functools.partial(
             _kernel,
             local_experts=experts,
+            n_chunks=i // ic,
             topk=topk,
             routed_scale=float(routed_scale),
             ar_spec=ar_spec,
@@ -531,9 +598,9 @@ def moe_tp_decode(
             in_specs=[vmem, vmem, vmem, *[hbm] * 8],
             out_specs=vmem,
             scratch_shapes=[
-                pltpu.VMEM((nb, h, 2 * i), FP8),
-                pltpu.VMEM((nb, i, h), FP8),
-                pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
+                pltpu.VMEM((nb, h, 2 * ic), FP8),
+                pltpu.VMEM((nb, ic, h), FP8),
+                pltpu.VMEM((nb, 1, 2 * ic), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
                 pltpu.VMEM((h, 2 * shared_inter), FP8),
                 pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
@@ -548,7 +615,7 @@ def moe_tp_decode(
                 pltpu.VMEM((1, e_pad), jnp.int32),
                 pltpu.SMEM((1, e_pad), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
-                pltpu.SemaphoreType.DMA((nb, 4)),
+                pltpu.SemaphoreType.DMA((nb, 4 if i == ic else 6)),
                 pltpu.SemaphoreType.DMA((4,)),
                 pltpu.SemaphoreType.DMA((1,)),
                 *all_reduce.scratch_shapes(ar_spec),
@@ -557,7 +624,7 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks),
+        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts),
     )(
         meta,
         x,

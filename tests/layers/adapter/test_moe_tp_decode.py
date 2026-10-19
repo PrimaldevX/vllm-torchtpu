@@ -68,10 +68,11 @@ class _SharedMLP(torch.nn.Module):
 
 
 class _Gate(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, experts=E):
         super().__init__()
         self.weight = torch.nn.Parameter(
-            (torch.randn(E, H) / math.sqrt(H)).to(torch.bfloat16), requires_grad=False
+            (torch.randn(experts, H) / math.sqrt(H)).to(torch.bfloat16),
+            requires_grad=False,
         )
 
     def forward(self, x):
@@ -85,7 +86,9 @@ class _RoutedExperts(torch.nn.Module):
         super().__init__()
         self.moe_config = moe_config
         self.quant_method = quant_method
-        self.global_num_experts = E
+        # E local experts; under EP, ep_size blocks of them.
+        par = moe_config.moe_parallel_config
+        self.global_num_experts = E * (par.ep_size if par.use_ep else 1)
         self.scoring_func = scoring_func
         self.renormalize = True
         self.use_grouped_topk = True
@@ -102,19 +105,25 @@ class _RoutedExperts(torch.nn.Module):
         self.w2_weight = param(torch.randn(E, INTER, H).to(FP8))
         self.w13_weight_scale_inv = param(torch.rand(E, 1, 1, 2 * INTER))
         self.w2_weight_scale_inv = param(torch.rand(E, 1, 1, H))
-        self.e_score_correction_bias = param(torch.rand(E) * 0.1)
+        self.e_score_correction_bias = param(torch.rand(self.global_num_experts) * 0.1)
         moe_routing.register_experts_start_buffer(self, device=torch.device("cpu"))
 
     def _ensure_moe_quant_config_init(self):
         pass
 
 
-def _moe_config(*, use_ep=False, skip_final_all_reduce=False):
+def _moe_config(
+    *, use_ep=False, skip_final_all_reduce=False, ep_size=None, tp_size=None, ep_rank=0
+):
+    if ep_size is None:
+        ep_size = 16 if use_ep else 1
+    if tp_size is None:
+        tp_size = 1 if use_ep else 16
     par = SimpleNamespace(
         use_ep=use_ep,
-        ep_size=16 if use_ep else 1,
-        ep_rank=0,
-        tp_size=1 if use_ep else 16,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        tp_size=tp_size,
         dp_size=1,
         pcp_size=1,
         enable_eplb=False,
@@ -129,7 +138,7 @@ def _moe_config(*, use_ep=False, skip_final_all_reduce=False):
         skip_final_all_reduce=skip_final_all_reduce,
         tp_size=par.tp_size,
         ep_size=par.ep_size,
-        ep_rank=0,
+        ep_rank=ep_rank,
         dp_size=1,
         pcp_size=1,
         sp_size=1,
@@ -143,6 +152,7 @@ class _Harness:
         self.layers = {}
         self.all_reduces = 0
         self.op_calls = []
+        self.statics = []
         self.selftest_calls = 0
         self.selftest_failures = []
         self.logs = []
@@ -156,8 +166,8 @@ class _Harness:
             layer_name=name,
             moe_config=mcfg,
             router=SimpleNamespace(),
-            routed_experts=_RoutedExperts(mcfg, qm, scoring_func),
-            gate=_Gate(),
+            routed_experts=(routed := _RoutedExperts(mcfg, qm, scoring_func)),
+            gate=_Gate(routed.global_num_experts),
             shared_experts=_SharedMLP() if shared else None,
             routed_scaling_factor=ROUTED_SCALE,
         )
@@ -229,7 +239,12 @@ def harness(monkeypatch):
         lambda: moe_tp_decode._Topology(mesh=SimpleNamespace(size=16), mesh_index=0),
     )
     monkeypatch.setattr(moe_tp_decode, "_gather", lambda obj: [obj])
-    monkeypatch.setattr(moe_tp_decode, "_get_op", lambda mesh, statics: h.op)
+
+    def get_op(mesh, statics):
+        h.statics.append(statics)
+        return h.op
+
+    monkeypatch.setattr(moe_tp_decode, "_get_op", get_op)
 
     def selftest(topo, buckets, device):
         h.selftest_calls += 1
@@ -299,7 +314,7 @@ def test_arming_moves_shared_expert_scale_and_all_reduce_into_the_op(harness):
     assert len(harness.op_calls) == 1 and shared0.calls == 0
     assert harness.all_reduces == 1
     assert torch.equal(out, (x.float() * 3).to(x.dtype))
-    _, scores, bias, pad_mask, w13, *_, rank = harness.op_calls[0]
+    _, scores, bias, pad_mask, w13, *_, rank, e0 = harness.op_calls[0]
     logits = target[0].gate(x)[0]
     assert torch.equal(scores, logits.sigmoid())
     assert torch.equal(bias, target[0].routed_experts.e_score_correction_bias)
@@ -307,6 +322,8 @@ def test_arming_moves_shared_expert_scale_and_all_reduce_into_the_op(harness):
     assert 16 - int(pad_mask[:16].sum()) == 11
     assert w13 is target[0].routed_experts.w13_weight
     assert rank.tolist() == [[0]]
+    assert e0.tolist() == [[0]]  # plain TP: every expert, from 0
+    assert not harness.statics[0].use_ep
 
     assert not _armed(sibling) and sibling.routed_scaling_factor == ROUTED_SCALE
     sibling_shared = sibling.shared_experts._layer
@@ -353,7 +370,11 @@ def test_fused_output_is_reduced_under_torch_compile(
 @pytest.mark.parametrize(
     ("spec", "reason"),
     [
-        ({"use_ep": True}, "needs TP MoE over 16 ranks"),
+        ({"tp_size": 8}, "needs TP MoE over 16 ranks"),
+        (
+            {"use_ep": True, "ep_size": 4, "tp_size": 2},
+            "needs EP x TP MoE over 16 ranks",
+        ),
         ({"skip_final_all_reduce": True}, "skip_final_all_reduce is set"),
         ({"shared": False}, "no shared expert"),
         ({"scoring_func": "softmax"}, "routing is not sigmoid"),
@@ -429,3 +450,109 @@ def test_failed_selftest_raises_and_arms_nothing(harness):
         moe_tp_decode.arm(model)
     runner = model.layers[0]
     assert not _armed(runner) and runner.shared_experts is not None
+
+
+@pytest.mark.parametrize(("ep_size", "tp_size", "ep_rank"), [(4, 4, 2), (16, 1, 5)])
+def test_arms_an_expert_range_on_ep_by_tp_weights(harness, ep_size, tp_size, ep_rank):
+    # TPU_MOE_EP_TP_SIZE=4 on 16 ranks is EP 4 x TP 4; flat EP is EP 16 x TP 1.
+    model = harness.model(
+        {"use_ep": True, "ep_size": ep_size, "tp_size": tp_size, "ep_rank": ep_rank}
+    )
+    runner = model.layers[0]
+    layer = runner.routed_experts
+    assert layer.global_num_experts == E * ep_size
+    assert moe_tp_decode.arm(model) == 1
+    assert _armed(runner) and runner._fused_output_is_reduced
+    # The shared expert moves into the op, so it is counted once (there).
+    assert runner.shared_experts is None and runner.routed_scaling_factor == 1.0
+    assert harness.statics[0].use_ep
+    assert layer._moe_tp_decode_e0.tolist() == [[ep_rank * E]]
+    assert layer._moe_tp_decode_e0.dtype == torch.int32
+    assert "kernel token counts [16, 32, 64]" in harness.logs[-1]
+
+    x = _x()
+    out = runner(hidden_states=x, router_logits=x)
+    assert len(harness.op_calls) == 1 and harness.all_reduces == 0
+    assert torch.equal(out, (x.float() * 3).to(x.dtype))
+    _, scores, bias, _, w13, *_, e0 = harness.op_calls[0]
+    # Routing covers every expert; the weights are this rank's block.
+    assert scores.shape == (16, E * ep_size) and bias.shape == (E * ep_size,)
+    assert w13 is layer.w13_weight and w13.shape[0] == E
+    assert e0.tolist() == [[ep_rank * E]]
+
+
+@pytest.mark.parametrize(
+    ("prefill", "spec", "want"),
+    [
+        (True, {}, 256),  # TP experts: steps above the cap take the prefill kernel
+        (False, {}, None),
+        (True, {"use_ep": True, "ep_size": 4, "tp_size": 4, "ep_rank": 1}, None),
+    ],
+)
+def test_prefill_kernel_arms_on_tp_experts_only(
+    harness, monkeypatch, prefill, spec, want
+):
+    monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL", prefill)
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256)
+    assert moe_tp_decode.arm(harness.model(spec)) == 1
+    assert harness.statics[0].prefill_above == want
+
+
+@pytest.mark.parametrize(
+    ("tokens", "prefill"), [(512, True), (256, False), (128, False)]
+)
+def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, prefill):
+    import jax
+    import jax.numpy as jnp
+
+    calls = []
+
+    def fake_prefill(x, *args):
+        calls.append(("prefill", x.shape[0], args[-1]))
+        return jnp.full_like(x, 7)
+
+    def fake_chain(x, *args):
+        calls.append(("chain", x.shape[0]))
+        return jnp.ones_like(x)
+
+    monkeypatch.setattr(moe_tp_decode, "_prefill_chain", fake_prefill)
+    monkeypatch.setattr(moe_tp_decode, "_tp_chain", fake_chain)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: False
+    )
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        prefill_above=256,
+    )
+    body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
+    f32, f8 = jnp.float32, jnp.float8_e4m3fn
+    operands = (
+        jnp.zeros((tokens, H), jnp.bfloat16),
+        jnp.zeros((tokens, E), f32),
+        jnp.zeros((E,), f32),
+        jnp.zeros((tokens,), jnp.bool_),
+        jnp.zeros((E, H, 2 * INTER), f8),
+        jnp.zeros((E, INTER, H), f8),
+        jnp.zeros((E, 1, 1, 2 * INTER), f32),
+        jnp.zeros((E, 1, 1, H), f32),
+        jnp.zeros((H, 2 * FS), f8),
+        jnp.zeros((2 * FS,), f32),
+        jnp.zeros((FS, H), f8),
+        jnp.zeros((H,), f32),
+        jnp.zeros((1, 1), jnp.int32),
+        jnp.zeros((1, 1), jnp.int32),
+    )
+    # Two "ranks" under vmap give the psum its named axis.
+    stacked = [jnp.stack([a, a]) for a in operands]
+    out = jax.vmap(body, axis_name="d")(*stacked)
+    if prefill:
+        # The prefill kernel's output is already summed: no psum on top.
+        assert calls == [("prefill", tokens, "d")]
+        assert bool(jnp.all(out == 7))
+    else:
+        assert calls == [("chain", tokens)]
+        assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2

@@ -224,6 +224,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
+    "TPU_PRECOMPILE_SPEC_MIXED",
     "TORCH_TPU_BASE_PORT",
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
@@ -280,6 +281,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
+    "vllm_torchtpu/layers/adapter/rmsnorm.py",
+    "vllm_torchtpu/kernels/fused_add_rmsnorm.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",

@@ -2733,6 +2733,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_fused_chain=False,
         _sampler_kwargs=lambda: {},
+        _verify_trim_rows=lambda padded_len, draft_lengths: 0,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -2743,6 +2744,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
         draft_token_ids=torch.zeros((2,), dtype=torch.int32),
         draft_lengths=torch.ones((2,), dtype=torch.int32),
+        draft_lengths_cpu=np.ones((2,), dtype=np.int32),
         segment_ids=torch.tensor([0, 1], dtype=torch.int32),
         group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
     )

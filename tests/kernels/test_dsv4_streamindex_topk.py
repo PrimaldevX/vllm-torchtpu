@@ -1568,6 +1568,122 @@ def test_skip_empty_decode_chunked_is_exact(T_list, chunk_tokens, drops_statical
         err_msg="skip_empty_decode_chunked disagrees with the unchunked call")
 
 
+# fmt: off
+@pytest.mark.parametrize(
+    "T_list,S_list,cp_size,cp_rank,bkv_p",
+    [
+        # MTP decode buckets: every request q_len 4 (the MIXED pass at bq 4).
+        pytest.param((4,), (9001,), 1, 0, 8, id="b1"),
+        pytest.param(
+            (4, 4, 4), (9001, 2052, 260), 1, 0, 8, id="b3_block_and_page_edges"
+        ),
+        pytest.param(
+            (4, 4), (8 * 9000 + 3, 8 * 2047 + 1), 8, 3, 32, id="dcp8_rank3_bkvp32"
+        ),
+        # Prefill-like rows in a small bucket: q_len not a multiple of 4,
+        # causal limits that vary inside a block.
+        pytest.param((4, 21), (5003, 3021), 1, 0, 16, id="partial_q_blocks"),
+        # A rank owning nothing of a short sequence.
+        pytest.param((4, 4), (9, 8 * 4000), 8, 5, 16, id="dcp8_rank5_empty_seq"),
+    ],
+)
+# fmt: on
+def test_decode_pack_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p):
+    """TPU_STREAMIDX_DECODE_PACK (packed body + page-major KV) is exact.
+
+    Indices and scores bitwise against the same call with the flag off. The
+    kernel name in the HLO is the positive control: the packed, page-major
+    kernel must be the one that ran, or the comparison is vacuous.
+    """
+    B = len(T_list)
+    page_size, H_I, D = 256, 32, 128
+    pages_per_seq = 40
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(B, pages_per_seq), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, 2048, 1, 4, bkv_p, _SAL, None, return_scores=True
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array([0, 0, B], jnp.int32)
+    kwargs["skip_empty_decode"] = True
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    off_hlo = streamindex_topk.lower(**kwargs).as_text()
+    on_hlo = streamindex_topk.lower(**kwargs, decode_pack=True).as_text()
+    assert "-pk-pm" in on_hlo and "-pk-pm" not in off_hlo, "packed kernel not built"
+
+    off_idx, off_scores = streamindex_topk(**kwargs)
+    on_idx, on_scores = streamindex_topk(**kwargs, decode_pack=True)
+    np.testing.assert_array_equal(
+        np.array(on_idx), np.array(off_idx), err_msg="decode_pack changed indices")
+    np.testing.assert_array_equal(
+        np.array(on_scores).view(np.int32), np.array(off_scores).view(np.int32),
+        err_msg="decode_pack changed scores")
+
+
+# fmt: off
+@pytest.mark.parametrize(
+    "T_list,S_list,cp_size,cp_rank,bkv_p,chunk",
+    [
+        # MTP decode: no q_len-1 row, the skip-empty cond takes the MIXED-only
+        # branch and the lazy DECODE schedules are never built.
+        pytest.param((4,), (9001,), 1, 0, 32, None, id="b1_mtp"),
+        pytest.param((4, 4, 4), (8 * 9000 + 3, 8 * 2047 + 1, 260), 8, 3, 16, None,
+                     id="b3_dcp8_rank3"),
+        # q_len-1 rows: the DECODE passes run, on schedules built in the branch
+        # (batched pass empty at 2 decodes, remainder pass not).
+        pytest.param((1, 1, 4, 4), (5000, 777, 9001, 260), 1, 0, 16, None,
+                     id="decode_rows_lazy"),
+        pytest.param((1, 1, 1, 1, 1, 4, 21), (5000, 777, 3000, 9, 8 * 4000, 9001, 3021),
+                     8, 5, 16, None, id="decode_batched_dcp8_rank5"),
+        # Chunked: the MIXED schedule branchless, DECODE ones eager (unchanged).
+        pytest.param((1, 1, 4, 250), (5000, 777, 9001, 3021), 1, 0, 16, 64,
+                     id="chunked"),
+    ],
+)
+# fmt: on
+def test_shared_meta_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p, chunk):
+    """TPU_STREAMIDX_SHARED_META builds the same kernel operands, so the same result.
+
+    Indices and scores bitwise against the same call with the flag off. The
+    positive control is structural: the flag must remove exactly the MIXED
+    schedule's empty-pass cond from the lowered program, or nothing changed.
+    Whether XLA then keeps one copy per step is a whole-program decision (a
+    two-call toy keeps two; the served 78-layer program keeps one), so it is
+    checked on the served program's profile, not here.
+    """
+    B = len(T_list)
+    page_size, H_I, D = 256, 32, 128
+    pages_per_seq = 40
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(B, pages_per_seq), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, 2048, 1, 4, bkv_p, _SAL, chunk, return_scores=True
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    kwargs.update(skip_empty_decode=True, skip_empty_decode_chunked=True,
+                  decode_pack=True)
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    off_hlo = streamindex_topk.lower(**kwargs).as_text()
+    on_hlo = streamindex_topk.lower(**kwargs, shared_meta=True).as_text()
+    n_off, n_on = off_hlo.count("stablehlo.case"), on_hlo.count("stablehlo.case")
+    assert n_on == n_off - 1, f"MIXED cond not dropped ({n_off} -> {n_on})"
+
+    off_idx, off_scores = streamindex_topk(**kwargs)
+    on_idx, on_scores = streamindex_topk(**kwargs, shared_meta=True)
+    n_tok = sum(T_list)
+    assert (np.array(off_idx)[:n_tok] >= 0).any(), "vacuous: no index selected"
+    np.testing.assert_array_equal(
+        np.array(on_idx), np.array(off_idx), err_msg="shared_meta changed indices")
+    np.testing.assert_array_equal(
+        np.array(on_scores).view(np.int32), np.array(off_scores).view(np.int32),
+        err_msg="shared_meta changed scores")
+
+
 def main(argv):
     del argv
 

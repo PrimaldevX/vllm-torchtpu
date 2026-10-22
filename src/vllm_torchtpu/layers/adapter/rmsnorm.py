@@ -35,6 +35,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
+from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_WEIGHT,
+    PREQUANT_ATTR,
+    PrequantSlot,
+)
 
 _ops: dict[tuple[float, bool], Callable[..., Any]] = {}
 _ops_lock = Lock()
@@ -75,6 +80,218 @@ def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
         return op
 
 
+_quant_ops: dict[tuple[float, bool], object] = {}
+
+
+def _get_quant_op(eps: float, emit_y: bool):
+    """The add + RMSNorm + per-row fp8 quant torch op (built at arming)."""
+    key = (float(eps), emit_y)
+    op = _quant_ops.get(key)
+    if op is not None:
+        return op
+    with _ops_lock:
+        op = _quant_ops.get(key)
+        if op is not None:
+            return op
+        tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+
+        def fn(
+            x: jax.Array, residual: jax.Array, weight: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            y, y_q, scale, new_res = kernel.fused_add_rms_norm_quant(
+                x, residual, weight, eps=float(eps), emit_y=emit_y
+            )
+            if y is None:
+                # No second consumer: y is dead and XLA drops this. Kept so a
+                # consumer nobody paired still reads correct values.
+                y = kernel.reference(x, residual, weight, float(eps))[0]
+            return y, y_q, scale, new_res
+
+        def fake(x, residual, weight):
+            return (
+                torch.empty_like(x),
+                torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+                torch.empty_like(residual),
+            )
+
+        op = pallas.jax_op(f"pallas::fused_add_rmsnorm_quant_y{int(emit_y)}_{tag}", fn)
+        op.register_fake(fake)
+        _quant_ops[key] = op
+        return op
+
+
+def _per_channel_fp8_linear(linear) -> bool:
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    qm = getattr(linear, "quant_method", None)
+    w = getattr(linear, "weight", None)
+    s = getattr(linear, "weight_scale", None)
+    return (
+        isinstance(qm, VllmFp8LinearMethodTPU)
+        and w is not None
+        and w.dtype == torch.float8_e4m3fn
+        and s is not None
+        and s.dim() == 1
+        and getattr(linear, "bias", None) is None
+    )
+
+
+def _pair(norm, linear, emit_y: bool) -> bool:
+    if not isinstance(norm, TpuRMSNorm) or not norm._pallas_ok:
+        return False
+    if not _per_channel_fp8_linear(linear):
+        return False
+    if getattr(linear, FP8_PALLAS_WEIGHT, None) is not None:
+        # Its unpaired path lifts the padded kernel copy, the paired one would
+        # not: the two sides of the rows branch must lift the same buffers.
+        return False
+    # Both ops are built here, at load, outside Dynamo: the forward only calls them.
+    from vllm_torchtpu.layers.adapter.linear_common import get_prequantized_matmul_op
+
+    get_prequantized_matmul_op()
+    slot = PrequantSlot()
+    norm._prequant_slot = slot
+    norm._op_quant = _get_quant_op(norm.variance_epsilon, emit_y)
+    setattr(linear, PREQUANT_ATTR, slot)
+    return True
+
+
+def arm_prequant(model: torch.nn.Module) -> int:
+    """TPU_FUSED_ADD_RMSNORM_QUANT: pair each decoder layer's residual-stream
+    norms with the per-channel FP8 linear that reads their output; returns the
+    number of pairs.
+
+    - ``input_layernorm`` -> the MLA ``fused_qkv_a_proj``. ``y`` is still
+      written when the indexer (``wk_weights_proj``) or ``g_proj`` reads it.
+    - ``post_attention_layernorm`` -> a dense MLP's ``gate_up_proj``. MoE
+      layers are left alone: their router reads ``y`` and the fused MoE ops
+      quantize with their own numerics.
+
+    Call on the target model only (the drafter's norms stay upstream).
+    """
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper,
+    )
+
+    n = 0
+    for layer in model.modules():
+        ln_in = getattr(layer, "input_layernorm", None)
+        ln_post = getattr(layer, "post_attention_layernorm", None)
+        attn = getattr(layer, "self_attn", None)
+        mlp = getattr(layer, "mlp", None)
+        if (
+            ln_in is None
+            or attn is None
+            or getattr(layer, "use_sequence_parallel_moe", False)
+        ):
+            continue
+        wrappers = [
+            m
+            for m in attn.modules()
+            if isinstance(m, VllmTPUMultiHeadLatentAttentionWrapper)
+        ]
+        if len(wrappers) == 1:
+            w = wrappers[0]
+            if (
+                w.kimi_preprocess is None
+                and w.q_lora_rank is not None
+                and w.fused_qkv_a_proj is not None
+            ):
+                emit_y = w.indexer is not None or w.g_proj is not None
+                n += _pair(ln_in, w.fused_qkv_a_proj, emit_y)
+        if (
+            mlp is not None
+            and getattr(mlp, "gate_up_proj", None) is not None
+            and getattr(mlp, "experts", None) is None
+        ):
+            n += _pair(ln_post, mlp.gate_up_proj, False)
+    return n
+
+
+_quant_moe_ops: dict[float, object] = {}
+
+
+def _get_quant_moe_op(eps: float):
+    """The add + RMSNorm op that also emits the stage-A MoE prefill kernel's
+    fp8 rows and scales (TPU_FUSED_ADD_RMSNORM_QUANT_MOE; built at arming)."""
+    key = float(eps)
+    op = _quant_moe_ops.get(key)
+    if op is not None:
+        return op
+    with _ops_lock:
+        op = _quant_moe_ops.get(key)
+        if op is not None:
+            return op
+        tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+
+        def fn(
+            x: jax.Array, residual: jax.Array, weight: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return kernel.fused_add_rms_norm_quant_moe(
+                x, residual, weight, eps=float(eps)
+            )
+
+        def fake(x, residual, weight):
+            rows, hidden = x.shape
+            return (
+                torch.empty_like(x),
+                torch.empty(
+                    (rows, hidden // 128, 128),
+                    dtype=torch.float8_e4m3fn,
+                    device=x.device,
+                ),
+                torch.empty((rows,), dtype=torch.float32, device=x.device),
+                torch.empty_like(residual),
+            )
+
+        op = pallas.jax_op(f"pallas::fused_add_rmsnorm_quant_moe_{tag}", fn)
+        op.register_fake(fake)
+        _quant_moe_ops[key] = op
+        return op
+
+
+def arm_prequant_moe(model: torch.nn.Module) -> int:
+    """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: pair each MoE layer's
+    post_attention_layernorm with its moe_tp_decode-armed experts, so on the
+    norm's Pallas (prefill-sized) branch the norm emits the stage-A prefill
+    kernel's own fp8 rows and scales and the op skips its quantization. The
+    bf16 y is still returned (the router reads it). Returns the pair count.
+
+    Call after moe_tp_decode.arm, on the target model only (the drafter's
+    norms stay upstream). Pairs only where every bucket the norm's Pallas
+    branch takes (`rows > bucket_gate_edge(_min_rows)`) is above the op's
+    prefill cut-over, so a filled slot always meets the prefill kernel."""
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+        PREQUANT_MOE_ATTR,
+        arm_prequant_op,
+    )
+
+    n = 0
+    for layer in model.modules():
+        ln_post = getattr(layer, "post_attention_layernorm", None)
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(ln_post, TpuRMSNorm) or not ln_post._pallas_ok or mlp is None:
+            continue
+        if ln_post._prequant_slot is not None:
+            continue  # already paired with a dense linear (TPU_FUSED_ADD_RMSNORM_QUANT)
+        runners = [m for m in mlp.modules() if isinstance(m, MoERunner)]
+        if len(runners) != 1:
+            continue
+        experts = runners[0].routed_experts
+        cut_over = arm_prequant_op(experts)
+        if cut_over is None or envs.bucket_gate_edge(ln_post._min_rows) < cut_over:
+            continue
+        ln_post._op_quant_moe = _get_quant_moe_op(ln_post.variance_epsilon)
+        slot = PrequantSlot()
+        ln_post._prequant_moe_slot = slot
+        setattr(experts, PREQUANT_MOE_ATTR, slot)
+        n += 1
+    return n
+
+
 def keep_upstream_path(model: torch.nn.Module) -> int:
     """Pin every TpuRMSNorm in ``model`` to the upstream path; returns the count.
 
@@ -106,6 +323,12 @@ class TpuRMSNorm(RMSNorm):
             # strided slices XLA fuses into their neighbours.
             and self.hidden_size >= envs.TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN
         )
+        # TPU_FUSED_ADD_RMSNORM_QUANT: set by arm_prequant.
+        self._prequant_slot = None
+        self._op_quant = None
+        # TPU_FUSED_ADD_RMSNORM_QUANT_MOE: set by arm_prequant_moe.
+        self._prequant_moe_slot = None
+        self._op_quant_moe = None
         if self._pallas_ok:
             self._op_res = _get_op(self.variance_epsilon, True)
             self._op_nores = _get_op(self.variance_epsilon, False)
@@ -124,11 +347,32 @@ class TpuRMSNorm(RMSNorm):
         ):
             return False
         rows = x.numel() // self.hidden_size
-        return rows >= self._min_rows and kernel.supports(rows, self.hidden_size)
+        # Cap rule: `rows > edge` (the bucket below `_min_rows`).
+        return rows > envs.bucket_gate_edge(self._min_rows) and kernel.supports(
+            rows, self.hidden_size
+        )
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
         if not self._use_pallas(x, residual):
             return super().forward(x, residual)
+        if self._prequant_slot is not None and residual is not None and x.dim() == 2:
+            # The same rows predicate as the plain Pallas path above: no new
+            # token-count branch. The paired linear takes (y_q, scale).
+            assert self._op_quant is not None
+            y, y_q, scale, new_res = self._op_quant(x, residual, self.weight.data)
+            self._prequant_slot.value = (y_q, scale)
+            return y, new_res
+        if (
+            self._prequant_moe_slot is not None
+            and residual is not None
+            and x.dim() == 2
+        ):
+            # Same rows predicate again. The paired MoE op takes (x_q, x_scale)
+            # on its stage-A prefill kernel; y still feeds the router.
+            assert self._op_quant_moe is not None
+            y, x_q, x_scale, new_res = self._op_quant_moe(x, residual, self.weight.data)
+            self._prequant_moe_slot.value = (x_q, x_scale)
+            return y, new_res
         if x.dim() == 2:
             # No view ops on the 2-D residual stream: a view the backend
             # lowers as a relayout would cost a full pass at these sizes.

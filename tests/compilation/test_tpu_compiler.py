@@ -296,10 +296,13 @@ class TestTpuCompilerCache:
     )
     def test_env_override_sc_offload_threshold(self, value, expected_threshold):
         """An explicit value is used as given, unset/empty/auto resolves
-        from the chip family, and 0 sets no flag at all."""
+        from the chip family, and 0 sets no flag at all. (The fused MoE
+        prefill kernel, set explicitly, lowers the all-reduce one; see
+        test_env_override_sc_all_reduce_floor_with_prefill_kernel.)"""
         env_mock = {
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
             "TPU_ACCELERATOR_TYPE": "v6e-8",
+            "FUSED_MOE_PREFILL_KERNEL": "0",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
@@ -316,6 +319,104 @@ class TestTpuCompilerCache:
                 ]
             )
             assert self._sc_offload_flags() == expected
+
+    @pytest.mark.parametrize(
+        "kernel,extra_env,all_reduce,all_gather",
+        [
+            # The chip-family default: lowered for all-reduces with the kernel
+            # set on explicitly ...
+            ("1", {}, 1 << 20, 64 << 20),
+            # ... but not by the kernel's default (on): this runs before the
+            # model is known, and the floor would move for every model.
+            (None, {}, 64 << 20, 64 << 20),
+            ("0", {}, 64 << 20, 64 << 20),
+            # An explicit value is kept as given, below or above 1 MiB.
+            ("1", {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "12345"}, 12345, 12345),
+            (
+                "1",
+                {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": str(8 << 20)},
+                8 << 20,
+                8 << 20,
+            ),
+            # An unknown chip family sets no flag.
+            ("1", {"TPU_ACCELERATOR_TYPE": "unknown-8"}, None, None),
+        ],
+    )
+    def test_env_override_sc_all_reduce_floor_with_prefill_kernel(
+        self, kernel, extra_env, all_reduce, all_gather
+    ):
+        """With the fused MoE prefill kernel set on, the chip-family all-reduce
+        threshold is lowered to 1 MiB (not by its default); explicit values are
+        kept; all-gathers keep their threshold."""
+        env_mock = {
+            **({} if kernel is None else {"FUSED_MOE_PREFILL_KERNEL": kernel}),
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            **extra_env,
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            expected = [
+                f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes={n}"
+                for op, n in (("all_reduce", all_reduce), ("all_gather", all_gather))
+                if n is not None
+            ]
+            assert self._sc_offload_flags() == expected
+
+    def test_env_override_user_all_reduce_flag_wins_with_prefill_kernel(self):
+        """An all-reduce flag in LIBTPU_INIT_ARGS is kept as given."""
+        env_mock = {
+            "FUSED_MOE_PREFILL_KERNEL": "1",
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=4096"
+            ),
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert self._sc_offload_flags() == [
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes="
+                f"{64 << 20}",
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=4096",
+            ]
+
+    @pytest.mark.parametrize(
+        "extra_env,warns",
+        [
+            ({}, False),
+            ({"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": str(8 << 20)}, True),
+            ({"TPU_ACCELERATOR_TYPE": "unknown-8"}, True),
+        ],
+    )
+    def test_env_override_warns_on_high_all_reduce_floor_with_prefill_kernel(
+        self, caplog, extra_env, warns
+    ):
+        """With the kernel on, a floor above 1 MiB (or none at all) logs one
+        warning."""
+        env_mock = {
+            "FUSED_MOE_PREFILL_KERNEL": "1",
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            **extra_env,
+        }
+        with (
+            patch.dict(os.environ, env_mock, clear=True),
+            caplog.at_level("WARNING", logger="vllm_torchtpu.env_override"),
+        ):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+        messages = [
+            r.getMessage()
+            for r in caplog.records
+            if "FUSED_MOE_PREFILL_KERNEL is on" in r.getMessage()
+        ]
+        assert len(messages) == (1 if warns else 0)
 
     @pytest.mark.parametrize("value", ["banana", "-1"])
     def test_env_override_sc_offload_bad_value_raises(self, value):
@@ -554,6 +655,52 @@ class TestTpuCompilerCache:
         assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
         assert os.listdir(b.cache_dir) == [key]
 
+    @staticmethod
+    def _rank_graph(rank, dead=None, live_slice=False):
+        """A graph with a rank baked in: in a dead view (`dead="view"`, like
+        vLLM's q-replicate `_local_view`), in a dead non-view op
+        (`dead="op"`), or in a live slice (`live_slice=True`)."""
+        import torch
+
+        def f(x):
+            if dead == "view":
+                x[..., rank * 4 : rank * 4 + 4].contiguous()
+            elif dead == "op":
+                torch.add(x, rank)
+            if live_slice:
+                return x[..., rank * 4 : rank * 4 + 4] * 2
+            return x * 2 + 1
+
+        return torch.fx.symbolic_trace(f)
+
+    def test_a_rank_in_a_dead_view_does_not_split_the_fingerprint(self):
+        from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+        a, b = self._rank_graph(0, dead="view"), self._rank_graph(1, dead="view")
+        assert a.code != b.code  # the premise: the code carries the rank
+        assert _graph_fingerprint(a) == _graph_fingerprint(b)
+        # Only the hash ignores it: the graph itself keeps its dead nodes.
+        assert "contiguous" in a.code
+
+    def test_a_rank_in_a_dead_op_or_a_live_slice_splits_the_fingerprint(self):
+        from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+        for kwargs in ({"dead": "op"}, {"live_slice": True}):
+            a, b = self._rank_graph(0, **kwargs), self._rank_graph(1, **kwargs)
+            assert _graph_fingerprint(a) != _graph_fingerprint(b), kwargs
+
+    def test_a_peer_artifact_differing_in_a_dead_view_is_replayed(
+        self, tmp_path, monkeypatch
+    ):
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, self._rank_graph(0, dead="view"))
+        compile(b, self._rank_graph(1, dead="view"))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+
     def test_a_peer_artifact_of_another_graph_is_not_replayed(
         self, tmp_path, monkeypatch
     ):
@@ -624,12 +771,12 @@ class TestTpuCompilerCache:
         compile(b)
         assert compiled == [0, 1]
 
-    @pytest.mark.parametrize("peer_replay", ["0", None])
+    @pytest.mark.parametrize("peer_replay", ["0"])
     def test_peer_replay_off_compiles_every_rank_itself(
         self, tmp_path, monkeypatch, peer_replay
     ):
-        """TPU_PRECOMPILE_PEER_REPLAY off, explicitly or by default (None): no
-        peer lookup, no wait, no link, and no fingerprint recorded; each rank
+        """TPU_PRECOMPILE_PEER_REPLAY=0 (on by default since trial 5): no peer
+        lookup, no wait, no link, and no fingerprint recorded; each rank
         compiles and saves its own."""
         import pickle
 

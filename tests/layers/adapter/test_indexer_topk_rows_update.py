@@ -131,11 +131,14 @@ def test_reuse_layers_read_the_donated_rows(rows, width, topk, num_tokens, compi
 
 
 @pytest.mark.tpu_test
-def test_mtp_restore_after_donated_write():
+def test_mtp_restore_after_donated_write(monkeypatch):
     """`Eagle3Proposer` holds the table and writes it outside the donated op:
     IndexShare snapshots step 0's rows, a later donated write clobbers them,
     and `_mtp_restore_topk` puts them back. The table must stay a valid,
     writable tensor across all of it."""
+    # The table-copy restore this covers; TPU_MTP_TOPK_INPLACE (on by default)
+    # restores through the proposer's row ids, which the stub does not carry.
+    monkeypatch.setenv("TPU_MTP_TOPK_INPLACE", "0")
     from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
     stale, topk_a, topk_b = _inputs(64, 32, 32, 16, 16, n=2)

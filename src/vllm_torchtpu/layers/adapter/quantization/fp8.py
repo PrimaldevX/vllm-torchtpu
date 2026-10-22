@@ -86,6 +86,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
     FP8_PALLAS_SCHED_GROUP_ATTR,
@@ -93,8 +94,12 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     get_fp8_linear_pallas_op,
+    prequantized_matmul,
     quantized_matmul,
     quantized_matmul_pallas,
+)
+from vllm_torchtpu.layers.adapter.linear_common import (
+    PREQUANT_ATTR as _PREQUANT_ATTR,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1351,6 +1356,18 @@ def _fp8_linear_pallas_selected(prefix: str) -> bool:
     return False
 
 
+def fp8_skinny_hbm_pin_selected(prefix: str) -> bool:
+    """TPU_FP8_SKINNY_HBM_PIN_SITES lists `prefix`'s site, "."-bounded: the layer's
+    fp8_skinny weight operand is constrained to HBM."""
+    if not prefix:
+        return False
+    for site in envs.TPU_FP8_SKINNY_HBM_PIN_SITES.split(","):
+        site = site.strip()
+        if site and (prefix == site or prefix.endswith("." + site)):
+            return True
+    return False
+
+
 def _fp8_pallas_sched_group(prefix: str) -> int | None:
     """TPU_IDX_TOPK_SCHED_GROUPS: G2 for the q_b_proj of a DCP indexer layer (its
     indexer op, built at model init, registered the layer), else None."""
@@ -1686,8 +1703,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             if sched_group is not None:
                 setattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, sched_group)
+            hbm_pin = fp8_skinny_hbm_pin_selected(
+                getattr(layer, "prefix", "") or self.prefix
+            )
+            if hbm_pin:
+                setattr(layer, FP8_PALLAS_HBM_PIN_ATTR, True)
             get_fp8_linear_pallas_op(
-                padded_copy, sched_group
+                padded_copy, sched_group, hbm_pin
             )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
@@ -1741,13 +1763,25 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+        slot = getattr(layer, _PREQUANT_ATTR, None)
+        prequant = None if slot is None else slot.value
+        if prequant is not None:
+            # TPU_FUSED_ADD_RMSNORM_QUANT: the norm that produced `x` also
+            # emitted its per-row fp8 quant (bit-identical to the one below).
+            assert slot is not None
+            slot.value = None
+            x_q, x_scale = prequant
+            out = prequantized_matmul(x_q, x_scale, weight, layer.weight_scale)
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+        elif getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
             # Only a DCP indexer layer's q_b_proj under TPU_IDX_TOPK_SCHED_GROUPS
             # carries a group; every other call is unchanged.
             sched_group = getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None)
             sched_kwargs = (
                 {} if sched_group is None else {"scheduling_group_id": sched_group}
             )
+            if getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False):
+                sched_kwargs["hbm_pin"] = True
             out = quantized_matmul_pallas(
                 x,
                 weight,

@@ -178,6 +178,7 @@ def compute_batched_seq_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    branchless: bool = False,
 ) -> MetadataRef:
     max_num_seqs = seq_lens.shape[0]
     max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
@@ -376,6 +377,17 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
+    if branchless:
+        # The same schedule as the cond below, as straight-line ops: an empty
+        # pass computes it and then zeroes every array, which is what
+        # `_empty_schedule` returns. A conditional is never CSE'd (each call
+        # site owns its branch computations), so every layer that builds this
+        # schedule from the same step metadata pays for its own copy; with no
+        # cond XLA keeps one per step.
+        sched = _compute_schedule()
+        return jax.tree_util.tree_map(
+            lambda x: jnp.where(is_empty_pass, jnp.zeros_like(x), x), sched
+        )
     return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
 
 
@@ -397,11 +409,14 @@ def compute_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    branchless: bool = False,
 ) -> MetadataRef:
     """Unified metadata calculation for batch_tile_idx, bq_idx, and bkv_idx.
 
     Passing a tuple of `chunk_token_start` values builds one schedule holding
     every chunk back to back, with `num_steps[m]` steps for chunk `m`.
+    `branchless` builds it without the empty-pass `lax.cond` (same arrays), so
+    identical calls in one program can be CSE'd into one.
     """
     return compute_batched_seq_metadata(
         seq_lens=seq_lens,
@@ -421,4 +436,5 @@ def compute_metadata(
         cp_rank=cp_rank,
         cp_size=cp_size,
         interleave_c=interleave_c,
+        branchless=branchless,
     )

@@ -159,16 +159,17 @@ def test_biggest_first_off_deals_in_vllm_order(compile_all_ranges, monkeypatch):
     [
         ("1", [4096, 2048, 1024, 512, 256, 128, 64, 32]),
         ("0", SIZES[:8]),
-        (None, SIZES[:8]),
+        # Biggest first is on by default (trial 5, as upstream #1810).
+        (None, [4096, 2048, 1024, 512, 256, 128, 64, 32]),
     ],
 )
-@pytest.mark.parametrize("peer_replay", ["0", None])
+@pytest.mark.parametrize("peer_replay", ["0"])
 def test_peer_replay_off_compiles_every_range_without_waiting(
     compile_all_ranges, monkeypatch, peer_replay, biggest_first, firsts
 ):
-    """TPU_PRECOMPILE_PEER_REPLAY off, explicitly or by default (None): no
-    owners and no waits; each local rank starts on a different range and
-    compiles every range itself."""
+    """TPU_PRECOMPILE_PEER_REPLAY=0 (on by default since trial 5): no owners
+    and no waits; each local rank starts on a different range and compiles
+    every range itself."""
     for name, value in [
         ("TPU_PRECOMPILE_PEER_REPLAY", peer_replay),
         ("TPU_PRECOMPILE_BIGGEST_FIRST", biggest_first),

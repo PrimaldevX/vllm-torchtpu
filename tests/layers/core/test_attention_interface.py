@@ -285,8 +285,9 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
 
 class DcpMlaTopkCapTest(parameterized.TestCase):
     """The capped sparse-MLA defaults #1510 shipped for GLM-5.2 AgentX: a
-    512 cap from DCP16 and a 256-token gather chunk. The port first kept
-    main's 0 (off), which left the DCP16 path slower than #1510."""
+    512 cap (from DCP16 there; from DCP8 since the trial-4 E2E served DCP8
+    with it) and a 256-token gather chunk (512 since trial 6). The port first
+    kept main's 0 (off), which left the DCP16 path slower than #1510."""
 
     def _env(self, **values):
         """Patch the real environment: `envs` reads it lazily, so setting the
@@ -295,8 +296,8 @@ class DcpMlaTopkCapTest(parameterized.TestCase):
         env.update({k: v for k, v in values.items() if v is not None})
         return mock.patch.dict(os.environ, env, clear=True)
 
-    @parameterized.parameters((1, 0), (2, 0), (8, 0), (16, 512), (32, 512))
-    def test_default_is_512_from_dcp16(self, dcp_size, cap):
+    @parameterized.parameters((1, 0), (2, 0), (4, 0), (8, 512), (16, 512), (32, 512))
+    def test_default_is_512_from_dcp8(self, dcp_size, cap):
         with self._env(TPU_DCP_MLA_TOPK_CAP=None):
             self.assertEqual(attention_interface.dcp_mla_topk_cap(dcp_size), cap)
 
@@ -307,6 +308,7 @@ class DcpMlaTopkCapTest(parameterized.TestCase):
         with self._env(TPU_DCP_MLA_TOPK_CAP="0"):
             self.assertEqual(attention_interface.dcp_mla_topk_cap(dcp_size), 0)
 
-    def test_default_chunk_is_256(self):
+    def test_default_chunk_is_512(self):
+        # 256 under #1510; 512 since the trial-6 E2E (bit-identical outputs).
         with self._env(TPU_DCP_MLA_TOPK_CAP_CHUNK=None):
-            self.assertEqual(envs.TPU_DCP_MLA_TOPK_CAP_CHUNK, 256)
+            self.assertEqual(envs.TPU_DCP_MLA_TOPK_CAP_CHUNK, 512)

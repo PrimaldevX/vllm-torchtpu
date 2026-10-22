@@ -1036,23 +1036,41 @@ def sparse_mla_attention(
 def dcp_mla_topk_cap(dcp_size: int) -> int:
     """`TPU_DCP_MLA_TOPK_CAP` as it applies at `dcp_size`; 0 is uncapped.
 
-    The default (-1) is auto: 512 from DCP16, as #1510 shipped it for GLM-5.2
-    AgentX, and off below. A rank owns ~topk/dcp_size slots, so a cap of 512
-    rarely binds at DCP16 and overflows every row at DCP2 (~30% slower
-    prefill there). An explicit value applies at any DCP size.
+    The default (-1) is auto: 512 from DCP8 (#1510 shipped it from DCP16 for
+    GLM-5.2 AgentX; trial 4 served it at DCP8), and off below. A rank owns
+    ~topk/dcp_size slots, so a cap of 512 rarely binds at DCP16, binds
+    sometimes at DCP8 and overflows every row at DCP2 (~30% slower prefill
+    there). An explicit value applies at any DCP size.
     """
     topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
     if topk_cap < 0:
-        return 512 if dcp_size >= 16 else 0
+        return 512 if dcp_size >= 8 else 0
     return topk_cap
 
 
-def _mixed_body_levers(value: str) -> tuple[str, ...]:
-    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set)."""
+def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
+    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
+    plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
     if not value or value == "0":
         return ()
     if value == "1":
-        return sparse_mla_kernel.MIXED_BODY_DEFAULT
+        levers = sparse_mla_kernel.MIXED_BODY_DEFAULT
+    else:
+        levers = tuple(v.strip() for v in value.split(",") if v.strip())
+    if kernel_v2:
+        levers += tuple(
+            v for v in sparse_mla_kernel.MIXED_KERNEL_V2_LEVERS if v not in levers
+        )
+    return levers
+
+
+def _decode_body_levers(value: str) -> tuple[str, ...]:
+    """TPU_MLA_DECODE_BODY_LEVERS -> the decode body's lever tuple ("1" =
+    `DECODE_BODY_DEFAULT`, else a comma list; empty / "0" = off)."""
+    if not value or value == "0":
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.DECODE_BODY_DEFAULT
     return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
@@ -1112,6 +1130,41 @@ def kv_write_in_gather_supported(
     )
 
 
+def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
+    """TPU_MLA_FUSED_SMALL_A2A: (operands pinned to HBM, scoped VMEM MiB) of the
+    fused call at a decode bucket of `num_tokens` (static: the JAX op's shape).
+    TPU_MLA_FUSED_SMALL_A2A_BUCKETS, when set, gives it per bucket as
+    `T=<pins>@<MiB>` entries (`<pins>`: all | none | roles of
+    `sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES` joined by `+`); a bucket it does
+    not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB."""
+    spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        tokens, _, rest = entry.partition("=")
+        pins, _, mib = rest.partition("@")
+        if int(tokens) != num_tokens:
+            continue
+        pins = pins.strip()
+        if pins == "all":
+            pin: bool | tuple = True
+        elif pins in ("none", ""):
+            pin = False
+        else:
+            pin = tuple(sorted(p.strip() for p in pins.split("+")))
+            bad = set(pin) - set(sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES)
+            if bad:
+                raise ValueError(
+                    f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}"
+                )
+        return pin, int(mib) if mib.strip() else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+    pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
+    vmem_mib = (
+        envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
+        if pin
+        else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+    )
+    return bool(pin), int(vmem_mib)
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1137,7 +1190,11 @@ def sparse_mla_attention_dcp(
     prologue_fault: str | None = None,
     kv_write_fault: str | None = None,
     dcp_rank_ids: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    send_layout: bool = False,
+    fused_exchange: bool = False,
+    dcp_lane_ids: jax.Array | None = None,
+    fused_merge: bool = False,
+) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
     Args:
@@ -1164,6 +1221,26 @@ def sparse_mla_attention_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): the shard's rank as data, replacing
         the `all_to_all` of an iota. Same result.
+      send_layout: TPU_DCP_MLA_SEND_LAYOUT, decode buckets with the prologue
+        (`q_rope_table`) and TPU_DCP_MLA_MASK_IN_KERNEL only: the kernel writes
+        the packed real-rows merge exchange's send buffer itself
+        (`sparse_mla_kernel.SEND_PAD_ROWS`), and the op returns `(kv_cache_nope,
+        kv_cache_rope, send)` with `send` int16 `[dcp_size * dcp_size,
+        SEND_PAD_ROWS + num_tokens * num_heads // dcp_size, lkv_dim]`, sharded
+        over `dcp_axis_name` (each rank's `[dcp_size, ...]` block, destination
+        major). Its sent rows are bit for bit the rows
+        `cp_mla_attention._all_to_all_packed` builds from `(output, lse)`.
+      fused_exchange: TPU_MLA_FUSED_SMALL_A2A, with `send_layout`, the rank
+        operand and `dcp_lane_ids` (i32[dcp_size] sharded over
+        `dcp_axis_name`, this rank's lane on the mesh's other axis), on a
+        bucket `cp_mla_attention.fused_small_a2a_applies` takes: the kernel
+        also runs the small all-to-all on its send blocks, and the op returns
+        `(kv_cache_nope, kv_cache_rope, o_recv, l_recv)` -- what
+        `cp_mla_attention.send_small_unpack_local` returns from the send
+        buffer, bit for bit: bf16 `[dcp_size * dcp_size, num_tokens *
+        num_heads // dcp_size, lkv_dim]` and f32 `[dcp_size * dcp_size,
+        num_tokens * num_heads // dcp_size]`, each rank's `[dcp_size, ...]`
+        block sender-major, partial rows past the real ones zero.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1237,6 +1314,34 @@ def sparse_mla_attention_dcp(
         P(dcp_axis_name, None, None),  # partial output
         P(dcp_axis_name, None),  # partial lse
     )
+    if send_layout:
+        if not (q_rope and envs.TPU_DCP_MLA_MASK_IN_KERNEL):
+            raise ValueError(
+                "send_layout needs the prologue (q_rope_table) and "
+                "TPU_DCP_MLA_MASK_IN_KERNEL"
+            )
+        if num_tokens > sparse_mla_kernel.FUSED_PREP_MAX_TOKENS:
+            raise ValueError(f"send_layout is decode-only, got {num_tokens} tokens")
+        out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # send
+    lane_axis = None
+    if fused_exchange:
+        if not (send_layout and dcp_rank_ids is not None and dcp_lane_ids is not None):
+            raise ValueError(
+                "fused_exchange needs send_layout, dcp_rank_ids and dcp_lane_ids"
+            )
+        lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
+        if len(lane_axes) > 1:
+            raise ValueError(
+                f"fused_exchange: at most one lane axis, got {mesh.axis_names}"
+            )
+        lane_axis = lane_axes[0] if lane_axes else None
+        if fused_merge:
+            out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # merged
+        else:
+            out_specs = out_specs[:2] + (
+                P(dcp_axis_name, None, None),  # received partials
+                P(dcp_axis_name, None),  # received lse
+            )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1262,10 +1367,29 @@ def sparse_mla_attention_dcp(
         *extra_,
     ):
         # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
-        # then this shard's DCP rank (TPU_DCP_RANK_OPERAND).
+        # then this shard's DCP rank (TPU_DCP_RANK_OPERAND), then its lane
+        # (TPU_MLA_FUSED_SMALL_A2A).
         rope_table_ = extra_[0] if q_rope else None
+        dcp_lane = extra_[-1][0] if fused_exchange else None
+        # TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: whether this bucket (static T)
+        # runs the exchange inside the kernel or by the separate small a2a.
+        fuse_here = bool(
+            fused_exchange
+            and topk_idx.shape[0] >= envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS
+        )
+        if fused_merge and not fuse_here:
+            raise ValueError(
+                "TPU_MLA_FUSED_SMALL_A2A_MERGE needs every fused bucket in the "
+                "kernel (TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS <= the bucket)"
+            )
+        # TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: buckets above it keep the
+        # kernel's exchange but merge in the op (jnp), same result schema.
+        merge_here = bool(
+            fused_merge
+            and topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+        )
         if dcp_rank_ids is not None:
-            dcp_rank = extra_[-1][0]
+            dcp_rank = extra_[int(q_rope)][0]
         else:
             dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
@@ -1352,6 +1476,24 @@ def sparse_mla_attention_dcp(
                     lse_in_kernel=mask_in_kernel and decode_bucket,
                     prologue_fault=prologue_fault,
                 )
+                if send_layout:
+                    split_kwargs["send_world"] = dcp_size
+                if fused_exchange and fuse_here:
+                    # Static per bucket (the JAX op's shape, not a torch gate).
+                    pin, vmem_mib = fused_small_a2a_bucket_config(num_tokens)
+                    split_kwargs["send_exchange"] = (
+                        dcp_axis_name,
+                        lane_axis,
+                        int(vmem_mib) * 1024 * 1024,
+                        pin,
+                        bool(merge_here),
+                    )
+                    assert dcp_lane is not None  # lifted when fused_exchange
+                    peer = [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
+                    if merge_here:
+                        # The real-token count: the kernel's unpack mask.
+                        peer.append(query_start_loc_[-1].astype(jnp.int32))
+                    split_kwargs["send_peer"] = jnp.stack(peer)
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
@@ -1385,6 +1527,22 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_TOKENS must be >= 0, got {small_chunk_tokens}"
             )
+        # TPU_DCP_MLA_MERGE_PIECES: one output buffer per merge chunk, so the
+        # merge's reduce-scatter k waits only for the attention chunks that
+        # produce its rows (mixed buckets with the in-kernel lse mask).
+        merge_pieces = 0
+        if (
+            envs.TPU_DCP_MLA_MERGE_PIECES
+            and not decode_bucket
+            and mask_in_kernel
+            and envs.TPU_MLA_SPARSE_SPLIT_Q
+            and topk_cap
+            and topk_idx.shape[0]
+            > envs.bucket_gate_edge(envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS)
+        ):
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
+
+            merge_pieces = _merge_chunks(topk_idx.shape[0])
         attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1415,7 +1573,9 @@ def sparse_mla_attention_dcp(
             mixed_live_widths=tuple(
                 int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
             ),
-            mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
+            mixed_body_levers=_mixed_body_levers(
+                envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
+            ),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
@@ -1424,6 +1584,9 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
+            decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
+            out_pieces=merge_pieces,
+            out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
@@ -1431,6 +1594,59 @@ def sparse_mla_attention_dcp(
         output, lse = attn[:2]
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]
+        if fused_exchange:
+            from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp
+
+            per = ql_nope.shape[1] // dcp_size
+            block = sparse_mla_kernel.SEND_PAD_ROWS + num_tokens * per
+            rows = 1 + query_start_loc_[-1:].astype(jnp.int32) * per
+            if merge_here:
+                # The kernel merged: its second output is the merged rows' words.
+                merged = jax.lax.bitcast_convert_type(lse, jnp.bfloat16)
+                return (
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    merged.reshape(num_tokens, per, -1),
+                )
+            if fused_merge:
+                # Above MERGE_MAX_TOKENS: `lse` is the receive buffer; the unpack
+                # and the merge (its jnp form) run here, in the op.
+                o_recv, l_recv = _cp._mask_unpack(
+                    lse.reshape(dcp_size, block, lse.shape[-1]),
+                    rows,
+                    block - sparse_mla_kernel.SEND_PAD_ROWS,
+                )
+                merged = _cp.merge_received_jax(o_recv, l_recv).astype(jnp.bfloat16)
+                return (
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    merged.reshape(num_tokens, per, -1),
+                )
+            if not fuse_here:
+                # Below TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: `lse` is the send
+                # buffer, exchanged by the separate small all-to-all + unpack
+                # exactly as the unfused op pair does (same kernels, same bits).
+                o_recv, l_recv = _cp.send_small_unpack_local(
+                    lse.reshape(dcp_size * block, lse.shape[-1]),
+                    rows,
+                    jnp.reshape(dcp_rank, (1,)).astype(jnp.int32),
+                    # pyrefly: ignore[bad-argument-type]
+                    jnp.reshape(dcp_lane, (1,)).astype(jnp.int32),
+                    world=dcp_size,
+                    axis_name=dcp_axis_name,
+                    lane_axis=lane_axis,
+                )
+                return (kv_cache_nope, kv_cache_rope, o_recv, l_recv)
+            # `lse` is the receive buffer [W * block, V]: the small all-to-all
+            # path's unpack (cp_mla_attention.send_small_unpack_local's).
+            o_recv, l_recv = _cp._mask_unpack(
+                lse.reshape(dcp_size, block, lse.shape[-1]),
+                rows,
+                block - sparse_mla_kernel.SEND_PAD_ROWS,
+            )
+            return (kv_cache_nope, kv_cache_rope, o_recv, l_recv)
+        if send_layout:
+            return (kv_cache_nope, kv_cache_rope, lse)  # `lse` is the send buffer
         if not mask_in_kernel:
             assert owns is not None
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
@@ -1439,6 +1655,9 @@ def sparse_mla_attention_dcp(
 
     rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
     if rank_args:
+        in_specs = in_specs + (P(dcp_axis_name),)
+    if fused_exchange:
+        rank_args = rank_args + (dcp_lane_ids,)
         in_specs = in_specs + (P(dcp_axis_name),)
     return jax.jit(
         shard_map.shard_map(

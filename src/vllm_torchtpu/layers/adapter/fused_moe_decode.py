@@ -62,6 +62,9 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill,
     plan_blocks,
 )
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    fused_moe_prefill_stage_a,
+)
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -186,14 +189,18 @@ def _prefill_layer(
     blocks = plan_blocks(
         x.shape[0], x.shape[1], w2.shape[1], shared_w2.shape[0], w1.dtype
     )
+    # FUSED_MOE_PREFILL_KERNEL_V2: the stage-A build (per-row activation
+    # scales), whole experts only.
+    v2 = envs.FUSED_MOE_PREFILL_KERNEL_V2 and blocks is None
     logger.info(
-        "Fused MoE prefill kernel traced for %d tokens (%s)",
+        "Fused MoE prefill kernel%s traced for %d tokens (%s)",
+        " (V2, stage A)" if v2 else "",
         x.shape[0],
         "whole experts"
         if blocks is None
         else "blocked ib={} ring={} chunk_rows={}".format(*blocks),
     )
-    return fused_moe_prefill(
+    return (fused_moe_prefill_stage_a if v2 else fused_moe_prefill)(
         x,
         w1,
         w2,
@@ -569,6 +576,32 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
+def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
+    """With the prefill kernel on by default (env_override.py lowers the
+    SparseCore all-reduce floor only when FUSED_MOE_PREFILL_KERNEL is set),
+    warn when the effective floor would keep the kernel's smallest all-reduce
+    (bf16 [min_tokens, hidden]) on the TensorCore, where MTP draft acceptance
+    collapsed with GLM-5.2."""
+    if envs.is_set("FUSED_MOE_PREFILL_KERNEL"):
+        return  # env_override.py lowered the floor or warned at import
+    from vllm_torchtpu.env_override import SC_ALL_REDUCE_FLAG, sc_all_reduce_floor
+
+    smallest = min_tokens * hidden * 2
+    floor = sc_all_reduce_floor()
+    if floor is not None and floor.isdigit() and int(floor) <= smallest:
+        return
+    logger.warning(
+        "Fused MoE prefill kernel armed (on by default) but the SparseCore "
+        "all-reduce offload floor is %s, above its smallest all-reduce (%d "
+        "bytes); with GLM-5.2 + MTP pass %s=2097152 in LIBTPU_INIT_ARGS (the "
+        "AgentX launch does) or set FUSED_MOE_PREFILL_KERNEL=1 explicitly. "
+        "See env_override.py.",
+        floor or "libtpu's default",
+        smallest,
+        SC_ALL_REDUCE_FLAG,
+    )
+
+
 def _serves_prefill_kernel(expert_parallel: bool) -> bool:
     """FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only for now: an EP
     layer keeps the GMM path above the cap, which at GLM-5.2 shapes was faster
@@ -686,6 +719,11 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         if any(_serves_prefill_kernel(s[1]) for s in signature[1])
         else "GMM MoE",
     )
+    if armed and any(_serves_prefill_kernel(s[1]) for s in signature[1]):
+        hidden = getattr(runners[0].moe_config, "hidden_dim", None)
+        if hidden:
+            # The prefill kernel serves the buckets above the cap.
+            _warn_sc_all_reduce_floor(max_tokens + 1, int(hidden))
     if envs.FUSED_MOE_PREFILL_KERNEL and any(s[1] for s in signature[1]):
         logger.info(
             "FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only: the EP "
@@ -730,10 +768,11 @@ def arm_runner_models(model_runner: Any) -> int:
     model (the MTP layer). Called once after the drafter has loaded, when every
     module has its final weight layout."""
     armed = arm_fused_moe_decode(model_runner.model, "target model")
-    for name in ("drafter", "_async_drafter"):
-        drafter = getattr(model_runner, name, None)
-        draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
-        if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
-            armed += arm_fused_moe_decode(draft, "draft model")
-            break
+    # `drafter` only: TPUModelRunner's `_async_drafter` is a property over it
+    # that asserts an EAGLE / DFlash drafter, so getattr() on a runner without
+    # one raises instead of returning the default.
+    drafter = getattr(model_runner, "drafter", None)
+    draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
+    if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
+        armed += arm_fused_moe_decode(draft, "draft model")
     return armed

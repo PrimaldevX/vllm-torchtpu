@@ -900,6 +900,7 @@ def coalesced_kv_append_dcp(
     interleave_size: int,
     kv_layout: KVLayout | str | None = KVLayout.HEAD_ALONG_SUBLANE,
     interpret: bool = False,
+    compact: bool = False,
 ) -> jax.Array:
     """DCP twin of `coalesced_kv_append`: writes the rows this rank owns.
 
@@ -919,6 +920,9 @@ def coalesced_kv_append_dcp(
       interleave_size: Consecutive positions per rank per round-robin step.
       kv_layout: Cache layout.
       interpret: Forwarded to `scatter_rows`.
+      compact: (`TPU_INDEXER_K_WRITE_COMPACT`) hand the writer only this
+        rank's rows (`compact_owned_rows`), so its scalar walk visits about
+        `T / dcp_size` tokens instead of `T`. Same rows, same order.
 
     Returns:
       The updated cache shard.
@@ -935,13 +939,74 @@ def coalesced_kv_append_dcp(
         dcp_size=dcp_size,
         interleave_size=interleave_size,
     )
+    dst_rows = kv_cache_utils.get_dst_rows(page, slot, page_size)
+    if compact:
+        k_packed, dst_rows = compact_owned_rows(
+            k_packed,
+            dst_rows,
+            num_seqs=seq_lens.shape[0],
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
     return scatter_rows(
         cache_kv,
         k_packed,
-        kv_cache_utils.get_dst_rows(page, slot, page_size),
+        dst_rows,
         kv_layout,
         interpret=interpret,
     )
+
+
+def owned_rows_bound(
+    num_tokens: int, *, num_seqs: int, dcp_size: int, interleave_size: int
+) -> int:
+    """A static upper bound on the rows one DCP rank owns in a step.
+
+    A sequence contributes `L` contiguous positions; rank `r` owns the
+    `interleave_size`-chunks at `r * I` in every `C = dcp_size * I` cycle, of
+    which a window of `L` positions meets at most `floor((L + I - 1) / C) + 1`,
+    each for at most `I` tokens: `<= L / dcp_size + I (I - 1) / C + I
+    <= L / dcp_size + 2 I`. Summed over the `num_seqs` slots (padding tokens
+    belong to none): `<= T / dcp_size + 2 I num_seqs`. Rounded up to 8."""
+    cap = -(-num_tokens // dcp_size) + 2 * interleave_size * num_seqs
+    return _align_to(cap, 8)
+
+
+def compact_owned_rows(
+    src: jax.Array,
+    dst_rows: jax.Array,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Moves the writable rows (`dst_rows >= 0`) to the front, in order, and
+    cuts both arrays to `owned_rows_bound` rows; the tail is `SKIP_ROW`.
+
+    The scatter contract is unchanged: the writable rows keep their relative
+    order, so the writer forms exactly the same runs. Returns the inputs
+    untouched when the bound does not shrink them (decode buckets).
+
+    The compaction index is `idx[j] = #{t : cumsum(valid)[t] <= j}`, the
+    first token with `j + 1` writable tokens at or before it -- a dense
+    `[cap, T]` compare-and-count (no gather loop, unlike `searchsorted`)."""
+    num_tokens = dst_rows.shape[0]
+    cap = owned_rows_bound(
+        num_tokens,
+        num_seqs=num_seqs,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    if cap >= num_tokens:
+        return src, dst_rows
+    valid = dst_rows >= 0
+    csum = jnp.cumsum(valid.astype(jnp.int32))
+    j = jnp.arange(cap, dtype=jnp.int32)
+    idx = jnp.sum((csum[None, :] <= j[:, None]).astype(jnp.int32), axis=1)
+    idx = jnp.minimum(idx, num_tokens - 1)
+    keep = j < csum[-1]
+    dst_c = jnp.where(keep, jnp.take(dst_rows, idx), jnp.int32(kv_cache_utils.SKIP_ROW))
+    return jnp.take(src, idx, axis=0), dst_c
 
 
 def scatter_rows_reference(

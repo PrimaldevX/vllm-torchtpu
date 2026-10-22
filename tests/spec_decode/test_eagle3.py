@@ -663,7 +663,11 @@ def test_prepare_draft_inputs_async_device(device):
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
 @pytest.mark.parametrize("chunk_sizes", [[2], [2, 2], [3, 1]])
 @pytest.mark.parametrize("return_device", [False, True])
-def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
+def test_propose(
+    num_speculative_tokens, chunk_sizes, return_device, device, monkeypatch
+):
+    # The stub runner has no upload cache (TPU_H2D_REUSE_STEADY, on by default).
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "0")
     # Each variant exercises the @torch.compile draft wrappers at distinct
     # shapes; across the full parametrize sweep they otherwise accumulate past
     # dynamo's recompile_limit (8) in one process (FailOnRecompileLimitHit).
@@ -1721,6 +1725,16 @@ def test_index_sharing_dedupes_aliased_buffers():
     assert len(proposer._mtp_topk_buffers) == 1
 
 
+@pytest.fixture
+def table_copy_index_share(monkeypatch):
+    """The compaction / restore tests below cover IndexShare's table-copy path:
+    TPU_MTP_TOPK_INPLACE (on by default) snapshots by gather instead, and
+    TPU_H2D_REUSE_STEADY needs the real runner's upload cache."""
+    monkeypatch.setenv("TPU_MTP_TOPK_INPLACE", "0")
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "0")
+
+
+@pytest.mark.usefixtures("table_copy_index_share")
 def test_compact_gathers_last_token_rows_to_front():
     buf = torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4)
     proposer = _mtp_proposer_with_buffer(buf.clone())
@@ -1735,6 +1749,7 @@ def test_compact_gathers_last_token_rows_to_front():
     assert torch.equal(saved[0], torch.stack([buf[1], buf[4]]))
 
 
+@pytest.mark.usefixtures("table_copy_index_share")
 def test_second_chunk_step0_clobbers_first_chunk_rows_and_restore_fixes_it():
     """The buffer is one tensor indexed by position-in-the-current-forward, so
     chunk 1's step-0 indexer write lands on chunk 0's compacted rows. The
@@ -1779,6 +1794,7 @@ def test_skip_topk_toggle_applies_with_sharing():
     assert proposer.draft_model.model.skip_topk is True
 
 
+@pytest.mark.usefixtures("table_copy_index_share")
 def test_propose_index_share_order_across_two_chunks():
     """End-to-end ordering: compact+snapshot each chunk right after its step 0,
     and restore each chunk's rows before its own loop-step forward. Which

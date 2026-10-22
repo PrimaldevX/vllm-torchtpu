@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import re
 from typing import Any, cast
 
 import jax
@@ -46,6 +47,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (
+    dcp_lane_operand,
     dcp_rank_operand,
     get_dcp_group,
     get_or_create_dcp_mesh,
@@ -70,6 +72,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -81,13 +84,14 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    _fp8_linear_pallas_hbm_pinned_jax,
     _fp8_linear_pallas_jax,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, get_shared_jax_op, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -102,6 +106,13 @@ STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
 STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
 # MIXED-pass KV pages per block for small buckets when only the bq knob is set.
 STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
+# Small-bucket MIXED kv pages per block under TPU_STREAMIDX_DECODE_PACK when
+# TPU_STREAMIDX_SMALL_BUCKET_BKVP is unset: `T <= cap` buckets (1-2 MTP
+# requests) take the long block, larger small buckets the short one. GLM-5.2
+# DCP8 (9k-67k keys per rank): 32 pages wins from 47k keys up at 4-8 tokens,
+# 16 pages wins at 16 tokens and short contexts (32 regresses b3 at 9.4k keys).
+STREAMIDX_PACK_BKVP_CAP_TOKENS = 8
+STREAMIDX_PACK_BKVP = (32, 16)  # (T <= cap, T > cap)
 
 
 def _streamidx_block_sizes(
@@ -110,6 +121,7 @@ def _streamidx_block_sizes(
     small_bucket_bkvp: int | None,
     small_bucket_tokens: int,
     mixed_bkvp: int | None = None,
+    decode_pack: bool = False,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
 
@@ -126,7 +138,12 @@ def _streamidx_block_sizes(
             STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (mixed_bkvp,),
             STREAMIDX_QUERIES_PER_BLOCK,
         )
-    bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    if small_bucket_bkvp:
+        bkvp = small_bucket_bkvp
+    elif decode_pack:
+        bkvp = STREAMIDX_PACK_BKVP[num_tokens > STREAMIDX_PACK_BKVP_CAP_TOKENS]
+    else:
+        bkvp = STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     return (
         STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
         STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
@@ -271,9 +288,13 @@ def _dcp_indexer_a2a_for_bucket(
 
     `num_tokens` is the static padded bucket, so this picks one merge per
     compiled variant: decode-sized buckets keep the all-gather merge and
-    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    prefill-sized ones (buckets of at least `min_tokens`, tested as
+    `num_tokens > envs.bucket_gate_edge(min_tokens)`: the cap rule) take the
+    all-to-all. The all-to-all splits the bucket over the DCP ranks; a bucket
+    that does not divide keeps the all-gather unless TPU_DCP_INDEXER_A2A_MERGE
+    was set.
     """
-    return enabled and num_tokens >= min_tokens
+    return enabled and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
 def _qb_overlap_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -363,6 +384,7 @@ def _cp_scatter_indexer_k(
     writer: str = "xla",
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     rank_ids: jax.Array | None = None,
+    compact: bool = False,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -403,6 +425,7 @@ def _cp_scatter_indexer_k(
                 dcp_size=cp_size,
                 interleave_size=interleave_size,
                 kv_layout=kv_layout,
+                compact=compact,
             )
 
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
@@ -463,10 +486,38 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_args)
 
 
+def _is_draft_layer_prefix(prefix: str, num_hidden_layers: int | None) -> bool:
+    """True for an MTP draft layer: vLLM numbers those from the target's
+    `num_hidden_layers` up (`DeepSeekMultiTokenPredictor.mtp_start_layer_idx`),
+    so `...layers.<i>...` with `i >= num_hidden_layers` is the drafter's."""
+    if num_hidden_layers is None:
+        return False
+    m = re.search(r"layers\.(\d+)", prefix or "")
+    return m is not None and int(m.group(1)) >= num_hidden_layers
+
+
+def _streamidx_shared_meta_for(prefix: str) -> bool:
+    """TPU_STREAMIDX_SHARED_META for the indexer at `prefix`: off for the MTP
+    draft layer. Its rows are q_len 1, so the DECODE pass runs, and under the
+    flag that schedule is built lazily inside the skip-empty conditional,
+    serial with the kernel (+19 us per step on GLM-5.2, cancelling the drafter
+    LM head's gain); the flag's CSE across indexer layers is a backbone win
+    (one indexer layer in the drafter, nothing to share). Same result."""
+    if not envs.TPU_STREAMIDX_SHARED_META:
+        return False
+    model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    return not _is_draft_layer_prefix(
+        prefix, num_layers if isinstance(num_layers, int) else None
+    )
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._shared_meta = _streamidx_shared_meta_for(self.k_cache.prefix)
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
@@ -520,6 +571,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -575,7 +628,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket, mixed_bkvp
+                q.shape[0], *small_bucket, mixed_bkvp, decode_pack
             )
             topk_indices = streamindex_topk(
                 q,
@@ -594,18 +647,40 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                decode_pack=decode_pack,
+                shared_meta=shared_meta,
             )
             return cache_kv, topk_indices
-
-        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
-        jax_op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
 
         def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
             return torch.empty_like(cache_kv), torch.empty(
                 (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
             )
 
-        jax_op.register_fake(_fake)
+        def build_op(op_name: str):
+            op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
+            op.register_fake(_fake)
+            return op
+
+        # The kernel and fake capture only the values keyed here (this tree's
+        # streamidx knobs: small-bucket block sizes, skip-empty decode, mixed
+        # KV pages); the cache geometry and token counts come from the
+        # argument shapes.
+        jax_op = get_shared_jax_op(
+            "streamidx_topk",
+            (
+                topk,
+                chunk_tokens,
+                *small_bucket,
+                skip_empty_decode,
+                skip_empty_decode_chunked,
+                mixed_bkvp,
+                decode_pack,
+                shared_meta,
+                kv_cache_mode,
+            ),
+            build_op,
+        )
 
         def op(*args):
             new_cache, topk_indices = jax_op(*args)
@@ -654,6 +729,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
             global_group = register_indexer_layer(self.k_cache.prefix)
@@ -661,6 +738,29 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # i32 operand (one element per rank) instead of the iota all_to_all.
         rank_operand = envs.TPU_DCP_RANK_OPERAND
         rank_tensor = dcp_rank_operand() if rank_operand else None
+        # TPU_DCP_INDEXER_SMALL_AG: the kernel all-gather addresses its peers
+        # by (lane, rank), both as data: the lane rides in its own operand
+        # after the rank. (Not folded into the rank tensor: that one is shared
+        # with the attention ops, and the indexer capturing it first is what
+        # keeps its lifted name the same across buckets.)
+        small_ag = bool(
+            envs.TPU_DCP_INDEXER_SMALL_AG
+            and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+            and rank_operand
+        )
+        lane_tensor = dcp_lane_operand() if small_ag else None
+        k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
+        qb_overlap_fn = _fp8_linear_pallas_jax
+        if qb_overlap:
+            # TPU_FP8_SKINNY_HBM_PIN_SITES: the overlapped q_b runs what the q_b
+            # layer's own op would, so it pins its weight when that layer does.
+            from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                fp8_skinny_hbm_pin_selected,
+            )
+
+            layer_prefix = self.k_cache.prefix.split(".self_attn")[0]
+            if fp8_skinny_hbm_pin_selected(f"{layer_prefix}.self_attn.q_b_proj"):
+                qb_overlap_fn = _fp8_linear_pallas_hbm_pinned_jax
 
         def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -673,6 +773,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             distribution: jax.Array,
             qb_args: tuple[jax.Array, ...],  # (x, w_q, w_s), replicated, or ()
             rank_ids_arg: jax.Array | None,  # TPU_DCP_RANK_OPERAND: i32[dcp]
+            lane_ids_arg: jax.Array | None = None,  # TPU_DCP_INDEXER_SMALL_AG
         ) -> tuple[jax.Array, ...]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
@@ -692,16 +793,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 writer=writer,
                 kv_layout=kv_layout,
                 rank_ids=rank_ids_arg,
+                compact=k_write_compact,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket, mixed_bkvp
+                q.shape[0], *small_bucket, mixed_bkvp, decode_pack
             )
             overlap = {}
             if qb_overlap:
                 overlap = dict(
-                    overlap_fn=_fp8_linear_pallas_jax,
+                    overlap_fn=qb_overlap_fn,
                     overlap_args=tuple(qb_args),
                     # Decode buckets only: the skinny kernel's M range.
                     overlap_pin_max_tokens=fp8_skinny.MAX_M,
@@ -730,6 +832,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 ),
                 global_scheduling_group_id=global_group,
                 dcp_rank_ids=rank_ids_arg,
+                dcp_lane_ids=lane_ids_arg,
+                small_all_gather=small_ag,
+                decode_pack=decode_pack,
+                shared_meta=shared_meta,
                 **overlap,
             )
             if qb_overlap:
@@ -840,12 +946,69 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 rank_ids,
             )
 
+        def _streamidx_topk_dcp_rank_lane_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (),
+                rank_ids,
+                lane_ids,
+            )
+
+        def _streamidx_topk_dcp_qb_rank_lane_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            qb_x: jax.Array,  # q_b input, [num_tokens, q_lora_rank]
+            qb_w: jax.Array,  # fp8 [q_lora_rank, n] (flipped runtime layout)
+            qb_s: jax.Array,  # f32 [n] per-output-channel scale
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (qb_x, qb_w, qb_s),
+                rank_ids,
+                lane_ids,
+            )
+
         jax_fn = {
-            (False, False): _streamidx_topk_dcp_jax,
-            (False, True): _streamidx_topk_dcp_rank_jax,
-            (True, False): _streamidx_topk_dcp_qb_jax,
-            (True, True): _streamidx_topk_dcp_qb_rank_jax,
-        }[(bool(qb_overlap), bool(rank_operand))]
+            (False, False, False): _streamidx_topk_dcp_jax,
+            (False, True, False): _streamidx_topk_dcp_rank_jax,
+            (True, False, False): _streamidx_topk_dcp_qb_jax,
+            (True, True, False): _streamidx_topk_dcp_qb_rank_jax,
+            (False, True, True): _streamidx_topk_dcp_rank_lane_jax,
+            (True, True, True): _streamidx_topk_dcp_qb_rank_lane_jax,
+        }[(bool(qb_overlap), bool(rank_operand), small_ag)]
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
@@ -872,6 +1035,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # distribution
                 *((replicated,) * 3 if qb_overlap else ()),  # x, w_q, w_s
                 *((sharded,) if rank_operand else ()),  # rank ids
+                *((sharded,) if small_ag else ()),  # lane ids
             ),
             output_partition_specs=(
                 sharded,  # new cache_kv
@@ -891,7 +1055,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
-            *rest,  # (qb_x, qb_w, qb_s) with qb_overlap, then rank ids
+            *rest,  # (qb_x, qb_w, qb_s) with qb_overlap, then rank, lane ids
             **kwargs,
         ):
             del weights, k_packed, seq_lens, page_indices, cu_q_lens, distribution
@@ -910,6 +1074,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         def op(*args):
             if rank_tensor is not None:
                 args = (*args, rank_tensor)
+            if lane_tensor is not None:
+                args = (*args, lane_tensor)
             new_cache, local_topk, *rest = jax_op(*args)
             args[2].copy_(new_cache)
             if qb_overlap:
@@ -1048,6 +1214,60 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         return rows
 
 
+_qprep_ops: dict[tuple[int, int, int], Any] = {}
+
+
+def _get_indexer_qprep_op(n_head: int, rope_dim: int, min_tokens: int):
+    """TPU_INDEXER_QPREP_FUSED: the torch op around `kernels.indexer_qprep`.
+
+    Built at rebind (model construction), never under Dynamo. Token counts
+    below `min_tokens` take the same expression in plain XLA instead; that
+    choice is made on the static JAX shape, so torch traces one op for every
+    bucket."""
+    key = (n_head, rope_dim, min_tokens)
+    op = _qprep_ops.get(key)
+    if op is not None:
+        return op
+    from vllm_torchtpu.kernels import indexer_qprep
+
+    def fn(q: jax.Array, c: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
+        if q.shape[0] < min_tokens:
+            return indexer_qprep.reference(q, c, s, n_head=n_head, rope_dim=rope_dim)
+        return indexer_qprep.indexer_q_prep(q, c, s, n_head=n_head, rope_dim=rope_dim)
+
+    def fake(q, c, s):
+        return (
+            torch.empty(
+                (q.shape[0], n_head, c.shape[-1]),
+                dtype=torch.float8_e4m3fn,
+                device=q.device,
+            ),
+            torch.empty((q.shape[0], n_head), dtype=torch.float32, device=q.device),
+        )
+
+    op = pallas.jax_op(f"pallas::indexer_qprep_h{n_head}_r{rope_dim}_m{min_tokens}", fn)
+    op.register_fake(fake)
+    _qprep_ops[key] = op
+    return op
+
+
+def rope_half_split_leading_cs(
+    rotary_emb, positions: torch.Tensor, like: torch.Tensor, d: int, rope_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The `C` and `S` rows of `rope_half_split_leading`, `[T, d]` each, built
+    by the same ops (so XLA shares them with the k rope)."""
+    t = positions.flatten().shape[0]
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(like).index_select(
+        0, positions.flatten()
+    )
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    parts_c, parts_s = [cos, cos], [-sin, sin]
+    if d > rope_dim:
+        parts_c.append(cos.new_ones(t, d - rope_dim))
+        parts_s.append(sin.new_zeros(t, d - rope_dim))
+    return torch.cat(parts_c, dim=-1), torch.cat(parts_s, dim=-1)
+
+
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
 
@@ -1084,6 +1304,15 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
+        # pyrefly: ignore[bad-argument-type]
+        indexer._qprep_op = None
+        if envs.TPU_INDEXER_QPREP_FUSED:
+            # pyrefly: ignore[bad-argument-type]
+            indexer._qprep_op = _get_indexer_qprep_op(
+                indexer.n_head,
+                indexer.rope_dim,
+                envs.TPU_INDEXER_QPREP_FUSED_MIN_TOKENS,
+            )
         return cast("VllmTPUIndexer", indexer)
 
     def permute_rope_to_half_split(self) -> None:
@@ -1149,6 +1378,24 @@ class VllmTPUIndexer(Indexer):
 
         k = self.k_norm(k)
         permuted = getattr(self, "_rope_neox_permuted", False)
+        qprep_op = getattr(self, "_qprep_op", None)
+        if (
+            qprep_op is not None
+            and permuted
+            and rope_half_split_leading_supported(rotary_emb)
+        ):
+            # TPU_INDEXER_QPREP_FUSED: q rope + per-(token, head) amax + fp8
+            # cast in one pass over the [T, H*D] wq_b output, written straight
+            # in the [T, H, D] layout the top-k op reads.
+            k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
+            c, s_ = rope_half_split_leading_cs(
+                rotary_emb, positions, q, self.head_dim, self.rope_dim
+            )
+            q_fp8, q_scale = qprep_op(q.reshape(-1, self.n_head * self.head_dim), c, s_)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+            return self._finish_forward(
+                hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+            )
         if permuted and rope_half_split_leading_supported(rotary_emb):
             # Half-split columns: rope the whole head in place, no split/cat.
             q = rope_half_split_leading(rotary_emb, positions, q, self.rope_dim)
@@ -1186,7 +1433,11 @@ class VllmTPUIndexer(Indexer):
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
+        return self._finish_forward(
+            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+        )
 
+    def _finish_forward(self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer):
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.
         weights_dtype = weights.dtype
@@ -1591,6 +1842,8 @@ class VllmTPUMLAAttention(MLAAttention):
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         self.sparse_mla_dcp_rope_op = None
+        self.sparse_mla_dcp_send_op = None
+        self.sparse_mla_dcp_fused_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -1601,6 +1854,27 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.sparse_mla_dcp_rope_op = impl._build_sparse_mla_dcp_op(
                     self, dcp_size, impl.dcp_interleave_size, q_rope=True
                 )
+                # TPU_DCP_MLA_SEND_LAYOUT: the prologue op's decode variant
+                # that writes the packed real-rows merge's send buffer.
+                if envs.TPU_DCP_MLA_SEND_LAYOUT:
+                    self.sparse_mla_dcp_send_op = impl._build_sparse_mla_dcp_op(
+                        self,
+                        dcp_size,
+                        impl.dcp_interleave_size,
+                        q_rope=True,
+                        send_layout=True,
+                    )
+                    # TPU_MLA_FUSED_SMALL_A2A: its variant that also runs the
+                    # small all-to-all (buckets fused_small_a2a_applies takes).
+                    if envs.TPU_MLA_FUSED_SMALL_A2A and envs.TPU_DCP_RANK_OPERAND:
+                        self.sparse_mla_dcp_fused_op = impl._build_sparse_mla_dcp_op(
+                            self,
+                            dcp_size,
+                            impl.dcp_interleave_size,
+                            q_rope=True,
+                            send_layout=True,
+                            fused_exchange=True,
+                        )
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention
@@ -2016,6 +2290,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
+        if envs.TPU_FUSED_OPROJ_AR:
+            return small_all_reduce_op.row_parallel_or(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]
 
 

@@ -745,3 +745,212 @@ def test_merge_overlap_fn_is_exact():
     np.testing.assert_array_equal(
         np.asarray(topk), np.asarray(streamindex_topk_dcp(*args, **kwargs))
     )
+
+
+# ===================================================================== #
+# TPU_SC_TOPK_DCP_MERGE_FLAT: flat rank-major gather, unpadded merge.
+# ===================================================================== #
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [4, 16, 32, 64])
+def test_flat_merge_matches_padded(dcp_size, q_len):
+    """Flag on vs off, byte for byte; q_len 64 (> 32) takes the padded path
+    either way."""
+    _need_devices(dcp_size)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(dcp_size, 41, q_len=q_len)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=False))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=True))
+    np.testing.assert_array_equal(got, want)
+    assert (want >= 0).any()
+
+
+@pytest.mark.multichip
+def test_flat_merge_with_merge_overlap_is_exact():
+    """The pinned merge-overlap path slices the flat gather for its barrier."""
+    _need_devices(8)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(8, 37, q_len=4)
+    x = jax.random.normal(jax.random.key(5), (4, 512), jnp.float32)
+    ov = dict(
+        overlap_fn=lambda v: v * 2.0,
+        overlap_args=(x,),
+        merge_overlap_fn=lambda v: jnp.tanh(v) + 1.0,
+    )
+    want_t, want_o = streamindex_topk_dcp(*args, **kwargs, **ov, flat_merge=False)
+    got_t, got_o = streamindex_topk_dcp(*args, **kwargs, **ov, flat_merge=True)
+    np.testing.assert_array_equal(np.asarray(got_t), np.asarray(want_t))
+    np.testing.assert_array_equal(np.asarray(got_o), np.asarray(want_o))
+
+
+# ===================================================================== #
+# TPU_DCP_INDEXER_SMALL_AG: the flat candidate all-gather as a Pallas
+# remote-DMA kernel.
+# ===================================================================== #
+
+
+def _per_device_ids(mesh, values):
+    """An i32 array sharded P(DCP_AXIS_NAME) whose shard on each device is
+    ``values[device position]`` -- different across the lane axis even though
+    the spec says replicated there, the way the torch bridge hands each rank
+    its own tensor."""
+    sharding = jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    flat = mesh.devices.reshape(-1)
+    width = len(values[0])
+    bufs = [
+        jax.device_put(jnp.asarray(values[i], jnp.int32), d) for i, d in enumerate(flat)
+    ]
+    dcp = mesh.shape[DCP_AXIS_NAME]
+    return jax.make_array_from_single_device_arrays((dcp * width,), sharding, bufs)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [4, 16, 32, 64])
+def test_small_all_gather_matches_xla_all_gather(dcp_size, q_len):
+    """Kernel vs XLA all-gather under the flat merge, byte for byte; q_len 64
+    (> 32) is the padded path, where the flag is a no-op."""
+    _need_devices(dcp_size)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(dcp_size, 43, q_len=q_len)
+    want = np.asarray(
+        streamindex_topk_dcp(*args, **kwargs, flat_merge=True, small_all_gather=False)
+    )
+    got = np.asarray(
+        streamindex_topk_dcp(*args, **kwargs, flat_merge=True, small_all_gather=True)
+    )
+    np.testing.assert_array_equal(got, want)
+    assert (want >= 0).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("q_len", [4, 8, 16])
+def test_small_all_gather_hlo_replaces_the_xla_all_gather(q_len):
+    """At T <= SMALL_AG_MAX_TOKENS the kernel replaces XLA's all-gather; above
+    it (16, the gate's other side) XLA's stays."""
+    # The module's constant (the package re-exports a function of the same
+    # name as the module).
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        SMALL_AG_MAX_TOKENS,
+    )
+
+    _need_devices(8)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(8, 43, q_len=q_len)
+
+    def text(flag):
+        fn = jax.jit(
+            lambda *a: streamindex_topk_dcp(
+                *a, **kwargs, flat_merge=True, small_all_gather=flag
+            )
+        )
+        return fn.lower(*args).compile().as_text()
+
+    xla_ag = re.compile(r" all-gather(-start)?\(")
+    assert xla_ag.search(text(False))
+    on = text(True)
+    if q_len <= SMALL_AG_MAX_TOKENS:
+        assert f"small_all_gather_n8_l{q_len * 2048}" in on
+        assert not xla_ag.search(on)
+    else:
+        # (The bare name also sits in this test's own HLO metadata.)
+        assert "small_all_gather_n8_l" not in on
+        assert xla_ag.search(on)
+
+
+@pytest.mark.multichip
+def test_small_all_gather_with_rank_and_lane_operands_on_a_lane_mesh():
+    """(2 lanes, DCP4) on 8 devices, rank and lane ids per device as the torch
+    op passes them (`dcp_rank_operand`, `dcp_lane_operand`): each lane
+    gathers its own group and gets the one-axis DCP4 answer."""
+    _need_devices(8)
+    _require_sparsecore()
+    dcp = 4
+    _, args, kwargs = _dcp_case(dcp, 47, q_len=4)
+    want = np.asarray(
+        streamindex_topk_dcp(*args, **kwargs, flat_merge=True, small_all_gather=False)
+    )
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:8]).reshape(2, dcp), ("lane", DCP_AXIS_NAME)
+    )
+    shards = jax.device_put(
+        np.asarray(args[2]), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    )
+    lane_args = (*args[:2], shards, *args[3:])
+    lane_kwargs = dict(kwargs, mesh=mesh)
+
+    lanes = _per_device_ids(mesh, [[lane] for lane in range(2) for _ in range(dcp)])
+
+    def run(ranks):
+        out = streamindex_topk_dcp(
+            *lane_args,
+            **lane_kwargs,
+            flat_merge=True,
+            small_all_gather=True,
+            dcp_rank_ids=_per_device_ids(mesh, [[r] for _ in range(2) for r in ranks]),
+            dcp_lane_ids=lanes,
+        )
+        return np.asarray(out)
+
+    np.testing.assert_array_equal(run(range(dcp)), want)
+    # Positive control: ranks 0 and 1 swapped write each other's slots (and
+    # resolve each other's owners), so the comparison can fail.
+    assert (run((1, 0, 2, 3)) != want).any()
+
+
+@pytest.mark.multichip
+def test_small_all_gather_with_merge_overlap_is_exact():
+    """The pinned merge-overlap path slices the kernel's output for its barrier."""
+    _need_devices(8)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(8, 37, q_len=4)
+    x = jax.random.normal(jax.random.key(5), (4, 512), jnp.float32)
+    ov = dict(
+        overlap_fn=lambda v: v * 2.0,
+        overlap_args=(x,),
+        merge_overlap_fn=lambda v: jnp.tanh(v) + 1.0,
+    )
+    want_t, want_o = streamindex_topk_dcp(
+        *args, **kwargs, **ov, flat_merge=True, small_all_gather=False
+    )
+    got_t, got_o = streamindex_topk_dcp(
+        *args, **kwargs, **ov, flat_merge=True, small_all_gather=True
+    )
+    np.testing.assert_array_equal(np.asarray(got_t), np.asarray(want_t))
+    np.testing.assert_array_equal(np.asarray(got_o), np.asarray(want_o))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("q_len", [4, 64])
+def test_lane_operand_is_kept_on_every_bucket(q_len):
+    """The torch op passes the lane operand on every bucket; on one that does
+    not take the small all-gather (q_len 64) JAX would prune it from the
+    exported call, which then takes one operand fewer than the op hands it
+    (`func.call ... expected 12, but got 13` at boot)."""
+    _need_devices(8)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(8, 59, q_len=q_len)
+    mesh = kwargs["mesh"]
+    ids = jax.device_put(
+        jnp.arange(8, dtype=jnp.int32),
+        jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)),
+    )
+    lanes = jax.device_put(
+        jnp.zeros(8, jnp.int32), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    )
+
+    def fn(*a):
+        *rest, rank, lane = a
+        return streamindex_topk_dcp(
+            *rest,
+            **kwargs,
+            flat_merge=True,
+            small_all_gather=True,
+            dcp_rank_ids=rank,
+            dcp_lane_ids=lane,
+        )
+
+    exp = jax.export.export(jax.jit(fn))(*args, ids, lanes)
+    assert len(exp.module_kept_var_idx) == len(args) + 2

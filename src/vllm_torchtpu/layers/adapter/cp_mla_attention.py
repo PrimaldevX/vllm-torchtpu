@@ -43,6 +43,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
+if envs.TPU_DCP_MERGE_VSPACE_FUSED:
+    # Registers the fused V-space operand ops at import, never in a trace.
+    from vllm_torchtpu.layers.adapter import dcp_vspace  # noqa: F401
+
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     """Widen a rank's query head slice to the whole DCP group's heads.
@@ -200,17 +204,71 @@ def merge_lse_partials_scatter_heads(
     return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
 
 
+def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
+    """TPU_DCP_MERGE_VSPACE_FUSED: whether this step's merge is
+    the chunked reduce-scatter merge with the heads-major weighted operand,
+    so the operand can be built in V space by `dcp_vspace` (#1935 trial 6's
+    TPU_DCP_MERGE_VSPACE). Fixed at trace time; every comparison here is one
+    `merge_lse_partials_scatter_heads` already makes for the same bucket. The
+    MTP drafter never takes it."""
+    if not envs.TPU_DCP_MERGE_VSPACE_FUSED or not is_backbone:
+        return False
+    if envs.TPU_DCP_MERGE_RS_BF16 == 2:
+        return False
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return False
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
+        return False
+    return _merge_chunks(num_tokens) > 1
+
+
+def merge_lse_partials_scatter_heads_vspace(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None,
+    wire_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`merge_lse_partials_scatter_heads` on a bucket `vspace_fused_applies`
+    takes, merging in V space: every chunk projects this rank's latent
+    partial `[T, H, C]` through W_UV `[H, C, V]` for all `H` heads, weights it
+    and reduce-scatters the V-wide result. Returns `[T, H / world, V]`, this
+    rank's heads already through W_UV."""
+    group = get_dcp_group()
+    narrow = envs.TPU_DCP_RS_OUT_PRECISION
+    rs_dtype = (wire_dtype or output.dtype) if narrow else None
+    chunks = _merge_chunks(output.shape[0])
+    merged = _merge_chunked(
+        output, lse, group, chunks, rs_dtype=rs_dtype, vspace=(w_uv, w_uv_scale)
+    )
+    return _retain_rank(merged)
+
+
 def _merge_chunks(num_tokens: int) -> int:
     """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
     merge into: 1 (unsplit) unless the bucket reaches
     `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` and splits into equal chunks whose
-    length is a multiple of 8 (the f32 sublane tile)."""
+    length is a multiple of 8 (the f32 sublane tile).
+
+    TPU_DCP_MERGE_CHUNKED_SMALL=m (>= 2): the buckets that gather their lse
+    once (TPU_DCP_MERGE_CHUNKED_LSE_AG, at most
+    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS tokens: c1k, c2k) split into m
+    chunks instead. The comparison is the one `_lse_gathered_once` already
+    makes for the same bucket, so no new shape guard; JAX (the kernel's merge
+    pieces) calls this with the static row count and gets the same answer."""
     chunks = envs.TPU_DCP_MERGE_CHUNKED
-    if (
-        chunks <= 1
-        or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
-        or num_tokens % (8 * chunks)
+    if chunks <= 1 or not (
+        num_tokens > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS)
     ):
+        return 1
+    small = envs.TPU_DCP_MERGE_CHUNKED_SMALL
+    if small >= 2 and _lse_gathered_once(num_tokens):
+        chunks = small
+    if num_tokens % (8 * chunks):
         return 1
     return chunks
 
@@ -221,9 +279,11 @@ def _merge_chunked(
     group: Any,
     chunks: int,
     rs_dtype: torch.dtype | None = None,
+    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """The reduce-scatter merge (`cp_lse_ag_out_rs`) over `chunks`
-    independent token chunks.
+    independent token chunks. `vspace` (TPU_DCP_MERGE_VSPACE_FUSED):
+    `(W_UV, scale)` over every head; the result is `[T, H / world, V]`.
 
     Every token's merge depends on its own row alone (the lse all-gather,
     logsumexp, weight and reduce-scatter sum all run per token), so splitting
@@ -236,20 +296,25 @@ def _merge_chunked(
     """
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
-        return _merge_chunked_lse_gathered(output, lse, group, chunks, rs_dtype)
-    if envs.TPU_DCP_MERGE_RS_BF16:
-        # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype.
+        return _merge_chunked_lse_gathered(
+            output, lse, group, chunks, rs_dtype, vspace=vspace
+        )
+    if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM or vspace:
+        # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
+        # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
-        pieces = [
-            _weighted_reduce_scatter(
-                output[c * step : (c + 1) * step],
-                lse_f32[c * step : (c + 1) * step],
-                _gather_lse(lse_f32[c * step : (c + 1) * step], group),
-                group,
-                rs_dtype,
+        pieces: list[torch.Tensor] = []
+        for c in range(chunks):
+            pieces.append(
+                _weighted_reduce_scatter(
+                    output[c * step : (c + 1) * step],
+                    lse_f32[c * step : (c + 1) * step],
+                    _gather_lse(lse_f32[c * step : (c + 1) * step], group),
+                    group,
+                    rs_dtype,
+                    vspace=vspace,
+                )
             )
-            for c in range(chunks)
-        ]
         return torch.cat(pieces, dim=0)
     pieces = [
         cp_lse_ag_out_rs(
@@ -282,10 +347,26 @@ def _weighted_reduce_scatter(
     lses: torch.Tensor,
     group: Any,
     rs_dtype: torch.dtype | None = None,
+    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
-    `[world, T, H]` for exactly `output`'s `T` rows."""
+    `[world, T, H]` for exactly `output`'s `T` rows. `vspace`
+    (TPU_DCP_MERGE_VSPACE_FUSED): the operand is built in V space."""
     merged_lse = torch.logsumexp(lses, dim=0)
+    if vspace is not None:
+        weight = torch.exp(lse_f32 - merged_lse)
+        return _weighted_reduce_scatter_vspace(output, weight, vspace, group, rs_dtype)
+    # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
+    # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
+    if (
+        envs.TPU_DCP_MERGE_WEIGHTED_HM
+        and envs.TPU_DCP_MERGE_RS_BF16 != 2
+        and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
+        > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
+    ):
+        return _weighted_reduce_scatter_heads_major(
+            output, lse_f32, merged_lse, group, rs_dtype
+        )
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
@@ -323,12 +404,79 @@ def _scatter_sum(
     return group.reduce_scatter(weighted.contiguous(), dim=1)
 
 
+def _weighted_reduce_scatter_vspace(
+    output: torch.Tensor,
+    weight: torch.Tensor,
+    vspace: tuple[torch.Tensor, torch.Tensor | None],
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`[T, H, C]` partial, f32 `[T, H]` weights, `(W_UV [H, C, V], scale)`
+    -> this rank's `[T, H / world, V]`: the sum over ranks of
+    `where(w > 0, (o_h @ W_UV_h) * w, 0)`, reduce-scattered over heads, with
+    the operand built heads-major in one computation (TPU_DCP_MERGE_VSPACE_FUSED).
+    Wire dtype as `_weighted_reduce_scatter_heads_major`'s."""
+    w_uv, w_uv_scale = vspace
+    wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
+    wire = wire or torch.float32
+    if output.device.type == "tpu":
+        from vllm_torchtpu.layers.adapter.dcp_vspace import vspace_weighted_heads_major
+
+        x = vspace_weighted_heads_major(output, weight, w_uv, w_uv_scale, wire)
+    else:
+        # The same arithmetic in torch (host tests): o's dtype operands, f32
+        # accumulation, the weight on the f32 product, one rounding.
+        v = torch.bmm(
+            output.transpose(0, 1).to(torch.float32),
+            w_uv.to(output.dtype).to(torch.float32),
+        )
+        if w_uv_scale is not None:
+            v = v * w_uv_scale.to(torch.float32).reshape(v.shape[0], 1, -1)
+        w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
+        x = torch.where(w > 0, v * w, torch.zeros_like(v)).to(wire)
+    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
+
+
+def _weighted_reduce_scatter_heads_major(
+    output: torch.Tensor,
+    lse_f32: torch.Tensor,
+    merged_lse: torch.Tensor,
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`_weighted_reduce_scatter`'s weight multiply and reduce-scatter with the
+    operand built heads-major (`TPU_DCP_MERGE_WEIGHTED_HM`) by the same
+    Pallas kernel `cp_lse_ag_out_rs` uses (`kernels/lse_rescale.py`), so no
+    relayout copy -- TensorCore or SparseCore data-format -- sits between the
+    weights and the reduce-scatter.
+
+    The wire dtype is `cp_lse_ag_out_rs`'s: `rs_dtype`
+    (TPU_DCP_RS_OUT_PRECISION), else f32; `TPU_DCP_MERGE_RS_BF16=1` makes it
+    bf16 (each f32 product rounded once, as `_scatter_sum`'s
+    `.to(bfloat16)`), the RS_BF16 merge, heads-major.
+    """
+    wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
+    if output.device.type == "tpu":
+        from vllm_torchtpu.distributed.dcp_comm import _lse_rescale_head_major
+
+        name = str(wire or torch.float32).removeprefix("torch.")
+        x = _lse_rescale_head_major(output, lse_f32, merged_lse, name)
+    else:
+        w = torch.exp(lse_f32 - merged_lse).transpose(0, 1).unsqueeze(-1)
+        x = output.transpose(0, 1).to(torch.float32) * w
+        x = torch.where(w > 0, x, torch.zeros_like(x))
+        if wire is not None:
+            x = x.to(wire)
+    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
+
+
 def _merge_chunked_lse_gathered(
     output: torch.Tensor,
     lse: torch.Tensor,
     group: Any,
     chunks: int,
     rs_dtype: torch.dtype | None = None,
+    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """`_merge_chunked` with one lse all-gather for every chunk
     (`TPU_DCP_MERGE_CHUNKED_LSE_AG`).
@@ -343,17 +491,32 @@ def _merge_chunked_lse_gathered(
     """
     step = output.shape[0] // chunks
     lse_f32 = lse.to(torch.float32)
-    gathered = _gather_lse(lse_f32, group)
-    pieces = [
-        _weighted_reduce_scatter(
-            output[c * step : (c + 1) * step],
-            lse_f32[c * step : (c + 1) * step],
-            gathered[:, c * step : (c + 1) * step],
-            group,
-            rs_dtype,
+    # No token-count test here: torch traces a compile range per graph, and a
+    # comparison it cannot decide over the range specializes the graph
+    # (ShapeSpecializationError on the mirror). MIN_TOKENS gates the kernel
+    # pieces (JAX, static shapes) only.
+    if envs.TPU_DCP_MLA_MERGE_PIECES >= 2:
+        # Chunk 0's rows alone, then the rest: chunk 0's reduce-scatter need
+        # not wait for every chunk's lse (TPU_DCP_MLA_MERGE_PIECES=2). The
+        # same rows, so the same gathered values.
+        head = _gather_lse(lse_f32[:step], group)
+        rest = _gather_lse(lse_f32[step:], group)
+        rows = [head] + [rest[:, (c - 1) * step : c * step] for c in range(1, chunks)]
+    else:
+        gathered = _gather_lse(lse_f32, group)
+        rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
+    pieces: list[torch.Tensor] = []
+    for c in range(chunks):
+        pieces.append(
+            _weighted_reduce_scatter(
+                output[c * step : (c + 1) * step],
+                lse_f32[c * step : (c + 1) * step],
+                rows[c],
+                group,
+                rs_dtype,
+                vspace=vspace,
+            )
         )
-        for c in range(chunks)
-    ]
     return torch.cat(pieces, dim=0)
 
 
@@ -460,20 +623,144 @@ def _all_to_all_packed(
     return o_recv, l_recv
 
 
+def send_layout_applies(
+    num_tokens: int,
+    num_heads: int,
+    vdim: int,
+    dtype: torch.dtype,
+    is_backbone: bool,
+) -> bool:
+    """Whether this step's DCP merge takes the kernel-written send buffer
+    (`TPU_DCP_MLA_SEND_LAYOUT`): exactly where `merge_lse_partials_scatter_heads`
+    would take the packed real-rows all-to-all, on a decode bucket the kernel
+    owns the lse of, at a geometry it can lay out. Fixed at trace time (the
+    backbone only, as for the all-to-all)."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return False
+    if not (
+        envs.TPU_DCP_MLA_SEND_LAYOUT
+        and envs.TPU_DCP_LSE_MERGE_A2A
+        and envs.TPU_DCP_LSE_MERGE_A2A_PACK
+        and envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS
+        and envs.TPU_MLA_SPARSE_SPLIT_Q
+        and envs.TPU_DCP_MLA_MASK_IN_KERNEL
+        and is_backbone
+        and dtype == torch.bfloat16
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+        and num_tokens <= sparse_kernel.FUSED_PREP_MAX_TOKENS
+        and num_tokens > envs.bucket_gate_edge(envs.TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS)
+    ):
+        return False
+    # The kernel runs one chunk of `num_tokens` (the capped chunk is larger
+    # than any decode bucket); its grid step is this many tokens.
+    _, batch = sparse_kernel._chunk_kernel_batch_size(
+        num_tokens,
+        sparse_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
+        envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS,
+        envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH,
+    )
+    return sparse_kernel.send_layout_supported(
+        num_tokens, num_heads, int(group.world_size), vdim, batch
+    )
+
+
+def merge_send_layout(
+    send: torch.Tensor, query_start_loc: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    """`merge_lse_partials_all_to_all` with pack + real rows, from the send
+    buffer the kernel wrote (`TPU_DCP_MLA_SEND_LAYOUT`).
+
+    `send` is this rank's int16 `[world, SEND_PAD_ROWS + T * local, V]`
+    (`sparse_mla_kernel.SEND_PAD_ROWS`): per destination, the lse word row at
+    `SEND_PAD_ROWS - 1` and the partial rows from `SEND_PAD_ROWS` on. One
+    ragged all-to-all moves `[SEND_PAD_ROWS - 1, SEND_PAD_ROWS + real * local)`
+    of each block -- the same `extra + real * local` rows, holding the same
+    bits, as `_all_to_all_packed`'s -- into the same place of the receiving
+    block, so the received partials and lse words are those of the packed
+    exchange and the merge below is its merge.
+
+    Returns `[T, local, V]` bf16, this rank's head slice of the result.
+    """
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    group = get_dcp_group()
+    world, block, vdim = send.shape
+    local = (block - SEND_PAD_ROWS) // num_tokens
+    rows = num_tokens * local
+    # Padded with the real count, so the last entry is that count.
+    real = query_start_loc[-1:].to(torch.int32)
+    if send_small_a2a_applies(num_tokens):
+        # One Pallas round of remote DMAs + the unpack, one JAX op; partial
+        # rows past the real ones zeroed as the ragged exchange leaves them.
+        # The merge below is the incumbent's, on the same bits.
+        from vllm_torchtpu.distributed.dcp import dcp_lane_operand
+
+        prebuild_send_small(world)
+        o_recv, l_recv = _SEND_SMALL_OPS[world](
+            send.reshape(world * block, vdim).contiguous(),
+            1 + real * local,
+            _DCP_RANK,
+            dcp_lane_operand(),
+        )
+        o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+        l_recv = l_recv.reshape(world, num_tokens, local)
+        return _merge_received(o_recv, l_recv).to(torch.bfloat16)
+    group_rows = int(envs.TPU_DCP_MLA_SEND_GROUP_ROWS)
+    if group_rows > 0 and send_group_rows_fit(block, group_rows):
+        # Row-group ragged exchange + unpack, one JAX op (tiled layout kept);
+        # the merge below is the incumbent's, on the same bits.
+        prebuild_send_group(world, group_rows)
+        o_recv, l_recv = _SEND_GROUP_OPS[(world, group_rows)](
+            send.reshape(world * block, vdim).contiguous(), 1 + real * local, _DCP_RANK
+        )
+        o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+        l_recv = l_recv.reshape(world, num_tokens, local)
+        return _merge_received(o_recv, l_recv).to(torch.bfloat16)
+    if envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK:
+        # The exchange and the unpack (row slices and bitcasts only: bits
+        # move, nothing is computed) as one JAX op; the merge below is the
+        # incumbent's, on the same partials and lse.
+        prebuild_send_unpack(world)
+        o_recv, l_recv = _SEND_UNPACK_OPS[world](
+            send.reshape(world * block, vdim).contiguous(), 1 + real * local, _DCP_RANK
+        )
+        o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+        l_recv = l_recv.reshape(world, num_tokens, local)
+        return _merge_received(o_recv, l_recv).to(torch.bfloat16)
+    recv = _ragged_all_to_all(send, 1 + real * local, group, skip=SEND_PAD_ROWS - 1)
+    o_recv = recv[:, SEND_PAD_ROWS:].reshape(world, num_tokens, local, vdim)
+    o_recv = o_recv.view(torch.bfloat16)
+    l_recv_words = recv[:, SEND_PAD_ROWS - 1]
+    hi = l_recv_words[:, :rows].to(torch.int32)
+    lo = l_recv_words[:, rows : 2 * rows].to(torch.int32)
+    l_recv = (
+        ((hi << 16) | (lo & 0xFFFF))
+        .view(torch.float32)
+        .reshape(world, num_tokens, local)
+    )
+    return _merge_received(o_recv, l_recv).to(torch.bfloat16)
+
+
 _RAGGED_A2A_OPS: dict = {}
 # This rank's DCP index as an int32 [1] device tensor: the exchange takes it
 # as data (XLA's SPMD export refuses `axis_index`'s partition-id).
 _DCP_RANK: torch.Tensor | None = None
 
 
-def _ragged_all_to_all(x: torch.Tensor, rows: torch.Tensor, group: Any) -> torch.Tensor:
-    """`_all_to_all(x)` for `x` `[world, R, V]`, moving only the first `rows`
-    (int32 `[1]`, the same on every rank) rows of each block; the rest of each
-    received block is zero. One `jax.lax.ragged_all_to_all` over the DCP mesh
-    axis (`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`)."""
+def _ragged_all_to_all(
+    x: torch.Tensor, rows: torch.Tensor, group: Any, skip: int = 0
+) -> torch.Tensor:
+    """`_all_to_all(x)` for `x` `[world, R, V]`, moving only rows `[skip, skip +
+    rows)` (`rows` int32 `[1]`, the same on every rank) of each block into the
+    same rows of the receiving block; the rest of each received block is zero.
+    One `jax.lax.ragged_all_to_all` over the DCP mesh axis
+    (`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`; `skip` for TPU_DCP_MLA_SEND_LAYOUT)."""
     world, block, vdim = x.shape
-    prebuild_ragged_all_to_all(world)
-    op = _RAGGED_A2A_OPS[world]
+    prebuild_ragged_all_to_all(world, skip)
+    op = _RAGGED_A2A_OPS[(world, skip)]
     return op(x.reshape(world * block, vdim).contiguous(), rows, _DCP_RANK).reshape(
         world, block, vdim
     )
@@ -485,17 +772,17 @@ def _ragged_fake(
     return torch.empty_like(x)
 
 
-def prebuild_ragged_all_to_all(world: int) -> None:
+def prebuild_ragged_all_to_all(world: int, skip: int = 0) -> None:
     """Build (register) the real-rows exchange op for a DCP group of `world`
-    ranks at model build, not inside a trace."""
+    ranks (rows from `skip` on) at model build, not inside a trace."""
     global _DCP_RANK
-    if world not in _RAGGED_A2A_OPS:
+    if (world, skip) not in _RAGGED_A2A_OPS:
         from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 
         # The same per-device int32 [1] rank buffer TPU_DCP_RANK_OPERAND hands
         # the DCP attention and indexer ops: one buffer for every consumer.
         _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
-        _RAGGED_A2A_OPS[world] = _build_ragged_all_to_all(world)
+        _RAGGED_A2A_OPS[(world, skip)] = _build_ragged_all_to_all(world, skip)
 
 
 def _retain_rank(out: torch.Tensor) -> torch.Tensor:
@@ -512,7 +799,7 @@ def _retain_rank(out: torch.Tensor) -> torch.Tensor:
     return out + (value - value)
 
 
-def _build_ragged_all_to_all(world: int):
+def _build_ragged_all_to_all(world: int, skip: int = 0):
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
 
@@ -529,14 +816,14 @@ def _build_ragged_all_to_all(world: int):
     def body(x, rows, rank):
         block = x.shape[0] // world
         me = rank[0].astype(jnp.int32)
-        n = jnp.clip(rows[0], 0, block).astype(jnp.int32)
+        n = jnp.clip(rows[0], 0, block - skip).astype(jnp.int32)
         sizes = jnp.full((world,), n, jnp.int32)
         return jax.lax.ragged_all_to_all(
             x,
             jnp.zeros_like(x),
-            jnp.arange(world, dtype=jnp.int32) * block,  # block d -> rank d
+            jnp.arange(world, dtype=jnp.int32) * block + skip,  # block d -> rank d
             sizes,
-            jnp.full((world,), me * block, jnp.int32),  # lands at block `me`
+            jnp.full((world,), me * block + skip, jnp.int32),  # lands at block `me`
             sizes,  # every rank sends the same count
             axis_name=DCP_AXIS_NAME,
         )
@@ -551,12 +838,413 @@ def _build_ragged_all_to_all(world: int):
         )(x, rows, rank)
 
     return sharded_jax_op(
-        f"pallas::dcp_merge_ragged_all_to_all_{world}",
+        f"pallas::dcp_merge_ragged_all_to_all_{world}"
+        + (f"_skip{skip}" if skip else ""),
         fn,
         mesh=mesh,
         input_partition_specs=(rank_spec, P(), rank_spec),
         output_partition_specs=rank_spec,
         fake=_ragged_fake,
+    )
+
+
+# How `merge_received_jax` forms the two weighted sums over ranks; the first
+# is the one the fused small all-to-all merge uses. "reduce_f32": f32 products summed by
+# a reduce (the HLO torch's merge compiles to; measured within a few elements
+# per 1e5 of it, not bitwise); "dot_default" / "dot_bf16": bf16-operand dots
+# (far off -- torch's multiply-then-sum is not lowered to a dot here).
+MERGE_JAX_VARIANTS = ("reduce_f32", "dot_default", "dot_bf16")
+
+
+def merge_received_jax(o, lse, variant: str = MERGE_JAX_VARIANTS[0]):
+    """`_merge_received` in jnp on `[R, n, V]` bf16 partials and `[R, n]` f32
+    lse (rows flattened): the f32 `[n, V]` merge."""
+    import jax.numpy as jnp
+    from jax import lax
+
+    finite = jnp.isfinite(lse)
+    shift = jnp.where(finite, lse, -jnp.inf).max(axis=0)
+    shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+    weights = jnp.where(finite, jnp.exp(lse - shift[None]), 0.0)
+    denom = weights.sum(axis=0)
+    weights = weights / jnp.where(denom > 0, denom, 1.0)
+    of = o.astype(jnp.float32)
+    of = jnp.where(jnp.isnan(of), 0.0, of)
+    w_hi = weights.astype(jnp.bfloat16).astype(jnp.float32)
+    w_lo = weights - w_hi
+    if variant == "reduce_f32":
+        return (of * w_hi[..., None]).sum(axis=0) + (of * w_lo[..., None]).sum(axis=0)
+    if variant == "dot_bf16":
+        of, w_hi, w_lo = (x.astype(jnp.bfloat16) for x in (of, w_hi, w_lo))
+    # Contract ranks, batch rows: [R, n, V] x [R, n] -> [n, V].
+    dims = (((0,), (0,)), ((1,), (1,)))
+
+    def dot(a, w):
+        return lax.dot_general(
+            a,
+            w,
+            dims,
+            precision=lax.Precision.DEFAULT,
+            preferred_element_type=jnp.float32,
+        )
+
+    return dot(of, w_hi) + dot(of, w_lo)
+
+
+_SEND_UNPACK_OPS: dict = {}
+
+
+def prebuild_send_unpack(world: int) -> None:
+    """Build (register) the send-layout exchange + unpack op
+    (`TPU_DCP_MLA_SEND_LAYOUT_UNPACK`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if world not in _SEND_UNPACK_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_UNPACK_OPS[world] = _build_send_unpack(world)
+
+
+def _send_unpack_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    group = get_dcp_group()
+    assert group is not None
+    world = int(group.world_size)
+    tl = x.shape[0] // world - SEND_PAD_ROWS
+    return (
+        x.new_empty((world, tl, x.shape[1]), dtype=torch.bfloat16),
+        x.new_empty((world, tl), dtype=torch.float32),
+    )
+
+
+def _build_send_unpack(world: int):
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+    skip = SEND_PAD_ROWS - 1
+
+    def body(x, rows, rank):
+        block = x.shape[0] // world
+        vdim = x.shape[1]
+        me = rank[0].astype(jnp.int32)
+        n = jnp.clip(rows[0], 0, block - skip).astype(jnp.int32)
+        sizes = jnp.full((world,), n, jnp.int32)
+        recv = jax.lax.ragged_all_to_all(
+            x,
+            jnp.zeros_like(x),
+            jnp.arange(world, dtype=jnp.int32) * block + skip,
+            sizes,
+            jnp.full((world,), me * block + skip, jnp.int32),
+            sizes,
+            axis_name=DCP_AXIS_NAME,
+        ).reshape(world, block, vdim)
+        tl = block - SEND_PAD_ROWS
+        o = lax.bitcast_convert_type(recv[:, SEND_PAD_ROWS:], jnp.bfloat16)
+        words = recv[:, SEND_PAD_ROWS - 1]
+        hi = words[:, :tl].astype(jnp.int32)
+        lo = words[:, tl : 2 * tl].astype(jnp.int32)
+        lse = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+        return o, lse
+
+    def fn(
+        x: jax.Array, rows: jax.Array, rank: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec),
+            out_specs=(rank_spec, rank_spec),
+            check_vma=False,
+        )(x, rows, rank)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_unpack_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec),
+        output_partition_specs=(rank_spec, rank_spec),
+        fake=_send_unpack_fake,
+    )
+
+
+def send_group_rows_fit(block: int, group_rows: int) -> bool:
+    """Whether a send block of `block` rows splits into whole groups of
+    `group_rows` rows (static: `block` is the bucket's)."""
+    return group_rows in (8, 16) and block % group_rows == 0
+
+
+_SEND_GROUP_OPS: dict = {}
+_SEND_SMALL_OPS: dict = {}
+
+
+def send_small_a2a_applies(num_tokens: int) -> bool:
+    """Whether `merge_send_layout` exchanges this bucket with the Pallas
+    small all-to-all (`TPU_DCP_MLA_SEND_SMALL_A2A`): `T <= cap` on the static
+    bucket size, and only where the indexer's small all-gather already lifts
+    the lane operand on every bucket (so no bucket lifts a buffer another
+    does not)."""
+    return bool(
+        envs.TPU_DCP_MLA_SEND_SMALL_A2A
+        and envs.TPU_DCP_INDEXER_SMALL_AG
+        and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+        and envs.TPU_DCP_RANK_OPERAND
+        and num_tokens <= envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+    )
+
+
+def fused_small_a2a_applies(num_tokens: int) -> bool:
+    """Whether the decode MLA kernel runs this bucket's small all-to-all
+    itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket `send_small_a2a_applies`
+    takes whose attention grid is one step -- the decode body lever "step8"
+    on the capped fused-prep row-widths body. The only token-count gate is
+    `send_small_a2a_applies`' `T <= cap` (a power of 2): the rest is static --
+    the cap itself at most DECODE_STEP8_TOKENS (a power-of-2 bucket at or
+    below it is its own step) and within the small-chunk path. Fixed at trace
+    time on the static bucket size. The cap is the one that applies at this
+    DCP size (`dcp_mla_topk_cap`: the auto default caps only at DCP >= 8)."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+    from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
+
+    if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
+        return False
+    group = get_dcp_group()
+    dcp_size = 1 if group is None else int(group.world_size)
+    value = envs.TPU_MLA_DECODE_BODY_LEVERS
+    levers = (
+        sparse_kernel.DECODE_BODY_DEFAULT
+        if value == "1"
+        else tuple(
+            v.strip() for v in (value or "").split(",") if v.strip() and v != "0"
+        )
+    )
+    return bool(
+        "step8" in levers
+        and dcp_mla_topk_cap(dcp_size)
+        and envs.TPU_DCP_MLA_FUSED_PREP
+        and envs.TPU_MLA_DECODE_ROW_WIDTHS
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        <= sparse_kernel.DECODE_STEP8_TOKENS
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+    )
+
+
+def merge_fused_recv(
+    o_recv: torch.Tensor, l_recv: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    """`merge_send_layout`'s small all-to-all merge from the partials and lse
+    the fused-exchange attention op unpacked (`TPU_MLA_FUSED_SMALL_A2A`):
+    `o_recv` bf16 `[world, T * local, V]`, `l_recv` f32 `[world, T * local]`,
+    real rows only (the rest zeroed as the small all-to-all's unpack leaves
+    them). Returns `[T, local, V]` bf16."""
+    world, rows, vdim = o_recv.shape
+    local = rows // num_tokens
+    o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+    l_recv = l_recv.reshape(world, num_tokens, local)
+    return _merge_received(o_recv, l_recv).to(torch.bfloat16)
+
+
+def prebuild_send_small(world: int) -> None:
+    """Build (register) the send-layout small all-to-all + unpack op
+    (`TPU_DCP_MLA_SEND_SMALL_A2A`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if world not in _SEND_SMALL_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_SMALL_OPS[world] = _build_send_small(world)
+
+
+def _send_small_fake(x, rows, rank, lane):
+    return _send_unpack_fake(x, rows, rank)
+
+
+def send_small_unpack_local(
+    x, rows, rank, lane, *, world: int, axis_name: str, lane_axis: str | None
+):
+    """One rank's `TPU_DCP_MLA_SEND_SMALL_A2A` exchange + unpack inside a
+    `shard_map` over the (lane, DCP) mesh: `_build_send_unpack`'s result, bit
+    for bit.
+
+    The kernel moves every destination block from the (8,128) tile row that
+    holds the lse word row (`SEND_PAD_ROWS - 1`) to the block's end; rows
+    before it stay unwritten and are never read. Partial rows past the real
+    ones (padding tokens) arrive as the sender left them and are zeroed by
+    the unpack, as the row-group exchange does."""
+    from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
+        small_all_to_all,
+    )
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    block = x.shape[0] // world
+    vdim = x.shape[1]
+    recv = small_all_to_all(
+        x,
+        num_cores=world,
+        axis=axis_name,
+        row0=(SEND_PAD_ROWS - 1) // 8 * 8,
+        rank=jnp.reshape(rank, (1,)),
+        lane_axis=lane_axis,
+        lane=None if lane_axis is None else jnp.reshape(lane, (1,)),
+        hbm_operand=envs.TPU_SMALL_COLL_HBM_OPERAND,
+    ).reshape(world, block, vdim)
+    return _mask_unpack(recv, rows, block - SEND_PAD_ROWS)
+
+
+def _build_send_small(world: int):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+
+    def body(x, rows, rank, lane):
+        return send_small_unpack_local(
+            x,
+            rows,
+            rank,
+            lane,
+            world=world,
+            axis_name=DCP_AXIS_NAME,
+            lane_axis=lane_axis,
+        )
+
+    def fn(
+        x: jax.Array, rows: jax.Array, rank: jax.Array, lane: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec, rank_spec),
+            out_specs=(rank_spec, rank_spec),
+            check_vma=False,
+        )(x, rows, rank, lane)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_small_a2a_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec, rank_spec),
+        output_partition_specs=(rank_spec, rank_spec),
+        fake=_send_small_fake,
+    )
+
+
+def prebuild_send_group(world: int, group_rows: int) -> None:
+    """Build (register) the send-layout row-group exchange + unpack op
+    (`TPU_DCP_MLA_SEND_GROUP_ROWS`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if (world, group_rows) not in _SEND_GROUP_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_GROUP_OPS[(world, group_rows)] = _build_send_group(world, group_rows)
+
+
+def _mask_unpack(recv, rows, tl: int):
+    """`_build_send_unpack`'s unpack of received blocks `[world, block, V]`
+    with partial rows at or past `rows - 1` (the real ones) zeroed."""
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    world, _, vdim = recv.shape
+    live = jnp.clip(rows[0] - 1, 0, tl).astype(jnp.int32)
+    row = jax.lax.broadcasted_iota(jnp.int32, (world, tl, vdim), 1)
+    part = recv[:, SEND_PAD_ROWS:]
+    part = jnp.where(row < live, part, jnp.zeros_like(part))
+    o = jax.lax.bitcast_convert_type(part, jnp.bfloat16)
+    words = recv[:, SEND_PAD_ROWS - 1]
+    hi = words[:, :tl].astype(jnp.int32)
+    lo = words[:, tl : 2 * tl].astype(jnp.int32)
+    lse = jax.lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+    return o, lse
+
+
+def send_group_unpack_local(
+    x, rows, rank, *, world: int, group_rows: int, axis_name: str
+):
+    """One rank's `TPU_DCP_MLA_SEND_GROUP_ROWS` exchange + unpack inside a
+    `shard_map` over the DCP axis: `_build_send_unpack`'s result, bit for bit.
+
+    `x` is this rank's int16 send buffer `[world * block, V]`, `rows` int32
+    `[1]` the row-ragged exchange's count `1 + real * local` from row
+    `SEND_PAD_ROWS - 1`, `rank` this rank's int32 `[1]` DCP index. The ragged
+    all-to-all moves whole `group_rows`-row groups `[first, last]` of each
+    block, `first` holding the lse word row and `last` the last real partial
+    row; on the (8,128)-tiled int16 buffer a group is one contiguous tile row,
+    so XLA exchanges it in place. The extra rows it carries (pad rows before
+    the lse row, padding tokens' partial rows) are never read or are zeroed."""
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    g = group_rows
+    block = x.shape[0] // world
+    vdim = x.shape[1]
+    gb = block // g
+    first = (SEND_PAD_ROWS - 1) // g
+    me = rank[0].astype(jnp.int32)
+    end = SEND_PAD_ROWS - 1 + jnp.clip(rows[0], 0, block - SEND_PAD_ROWS + 1)
+    n = jnp.clip((end + g - 1) // g - first, 0, gb - first).astype(jnp.int32)
+    sizes = jnp.full((world,), n, jnp.int32)
+    xg = x.reshape(world * gb, g, vdim)
+    recv = jax.lax.ragged_all_to_all(
+        xg,
+        jnp.zeros_like(xg),
+        jnp.arange(world, dtype=jnp.int32) * gb + first,  # block d -> rank d
+        sizes,
+        jnp.full((world,), me * gb + first, jnp.int32),  # lands at block `me`
+        sizes,
+        axis_name=axis_name,
+    ).reshape(world, block, vdim)
+    return _mask_unpack(recv, rows, block - SEND_PAD_ROWS)
+
+
+def _build_send_group(world: int, group_rows: int):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+
+    def body(x, rows, rank):
+        return send_group_unpack_local(
+            x, rows, rank, world=world, group_rows=group_rows, axis_name=DCP_AXIS_NAME
+        )
+
+    def fn(
+        x: jax.Array, rows: jax.Array, rank: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec),
+            out_specs=(rank_spec, rank_spec),
+            check_vma=False,
+        )(x, rows, rank)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_group{group_rows}_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec),
+        output_partition_specs=(rank_spec, rank_spec),
+        fake=_send_unpack_fake,
     )
 
 
@@ -654,7 +1342,13 @@ def _unpack_words(
 
 
 def sized_merge_local(
-    o: jax.Array, lse: jax.Array, *, world: int, a2a_max_tokens: int, axis_name: str
+    o: jax.Array,
+    lse: jax.Array,
+    *,
+    world: int,
+    a2a_max_tokens: int,
+    axis_name: str,
+    small: dict | None = None,
 ) -> jax.Array:
     """One rank's merge inside a `shard_map` over the DCP axis.
 
@@ -671,6 +1365,12 @@ def sized_merge_local(
       all-gather, weight, f32 reduce-scatter over heads.
 
     The two differ only in the order the `world` weighted f32 terms are summed.
+
+    With `small` (TPU_MTP_DCP_MERGE_SMALL_A2A: `max_tokens`, `rank`, `lane`,
+    `lane_axis`), buckets of `T <= small["max_tokens"]` move the packed words
+    with the Pallas small all-to-all: each destination block padded to whole
+    8-row tiles, every row moved (row0 = 0), so the received words the unpack
+    reads are `lax.all_to_all`'s bit for bit.
     """
     tokens, heads, vdim = o.shape
     local = heads // world
@@ -685,7 +1385,10 @@ def sized_merge_local(
     o_send = o.reshape(tokens, world, local, vdim).transpose(1, 0, 2, 3)
     l_send = lse.reshape(tokens, world, local).transpose(1, 0, 2)
     send, _ = _pack_words(o_send, l_send)
-    recv = jax.lax.all_to_all(send, axis_name, 0, 0, tiled=True)
+    if small is not None and tokens <= small["max_tokens"]:
+        recv = _small_exchange(send, world=world, axis_name=axis_name, **small)
+    else:
+        recv = jax.lax.all_to_all(send, axis_name, 0, 0, tiled=True)
     o_recv, l_recv = _unpack_words(recv, tokens, local, o.dtype)
     # Rank r's weight reads every rank's lse for this rank's heads, which is
     # exactly l_recv `[world, T, local]`.
@@ -696,6 +1399,40 @@ def sized_merge_local(
     for r in range(1, world):
         acc = acc + terms[r]
     return acc.astype(o.dtype)
+
+
+def _small_exchange(
+    send: jax.Array,
+    *,
+    world: int,
+    axis_name: str,
+    max_tokens: int,
+    rank: jax.Array,
+    lane: jax.Array,
+    lane_axis: str | None,
+) -> jax.Array:
+    """`lax.all_to_all(send, axis_name, 0, 0, tiled=True)` of the packed
+    `[world, R, V]` words through `small_all_to_all`: blocks padded to
+    `ceil(R / 8) * 8` rows, all rows moved, the padding sliced off."""
+    from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
+        small_all_to_all,
+    )
+
+    del max_tokens
+    _, rows, vdim = send.shape
+    block = -(-rows // 8) * 8
+    padded = jnp.pad(send, ((0, 0), (0, block - rows), (0, 0)))
+    recv = small_all_to_all(
+        padded.reshape(world * block, vdim),
+        num_cores=world,
+        axis=axis_name,
+        row0=0,
+        rank=jnp.reshape(rank, (1,)),
+        lane_axis=lane_axis,
+        lane=None if lane_axis is None else jnp.reshape(lane, (1,)),
+        hbm_operand=envs.TPU_SMALL_COLL_HBM_OPERAND,
+    ).reshape(world, block, vdim)
+    return recv[:, :rows]
 
 
 def prebuild_sized_merge(world: int) -> None:
@@ -715,25 +1452,81 @@ def prebuild_sized_merge(world: int) -> None:
     # (`_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS`).
     spec = P(DCP_AXIS_NAME)
 
-    def body(o, lse):
-        return sized_merge_local(
-            o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME
-        )
-
-    def fn(output: jax.Array, lse: jax.Array) -> jax.Array:
-        return jax.shard_map(
-            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
-        )(output, lse)
-
-    def fake(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    def fake(output: torch.Tensor, lse: torch.Tensor, *_) -> torch.Tensor:
         tokens, heads, vdim = output.shape
         return output.new_empty((tokens, heads // world, vdim))
 
-    _SIZED_MERGE_OPS[world] = sharded_jax_op(
-        f"pallas::mtp_dcp_merge_sized_{world}",
-        fn,
+    if not (envs.TPU_MTP_DCP_MERGE_SMALL_A2A and envs.TPU_DCP_RANK_OPERAND):
+
+        def body(o, lse):
+            return sized_merge_local(
+                o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME
+            )
+
+        def fn(output: jax.Array, lse: jax.Array) -> jax.Array:
+            return jax.shard_map(
+                body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+            )(output, lse)
+
+        _SIZED_MERGE_OPS[world] = sharded_jax_op(
+            f"pallas::mtp_dcp_merge_sized_{world}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=(spec, spec),
+            output_partition_specs=spec,
+            fake=fake,
+        )
+        return
+
+    # TPU_MTP_DCP_MERGE_SMALL_A2A: the op takes this rank's DCP index and lane
+    # as data on every bucket (the small all-to-all addresses peers by them);
+    # buckets above the small cap ignore them.
+    from vllm_torchtpu.distributed.dcp import dcp_lane_operand, dcp_rank_operand
+
+    small_cap = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+    rank_t = dcp_rank_operand(torch.device("tpu"))
+    lane_t = dcp_lane_operand(torch.device("tpu"))
+
+    def body_small(o, lse, rank, lane):
+        small = {
+            "max_tokens": small_cap,
+            "rank": rank,
+            "lane": lane,
+            "lane_axis": lane_axis,
+        }
+        return sized_merge_local(
+            o,
+            lse,
+            world=world,
+            a2a_max_tokens=cap,
+            axis_name=DCP_AXIS_NAME,
+            small=small,
+        )
+
+    def fn_small(
+        output: jax.Array, lse: jax.Array, rank: jax.Array, lane: jax.Array
+    ) -> jax.Array:
+        return jax.shard_map(
+            body_small,
+            mesh=mesh,
+            in_specs=(spec, spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(output, lse, rank, lane)
+
+    op = sharded_jax_op(
+        f"pallas::mtp_dcp_merge_sized_small_{world}",
+        fn_small,
         mesh=mesh,
-        input_partition_specs=(spec, spec),
+        input_partition_specs=(spec, spec, spec, spec),
         output_partition_specs=spec,
         fake=fake,
     )
+
+    def merge(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        return op(output, lse, rank_t, lane_t)
+
+    _SIZED_MERGE_OPS[world] = merge

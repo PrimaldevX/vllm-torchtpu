@@ -40,6 +40,13 @@ more valid rows run the plain two-shot. Valid rows are bitwise the plain
 kernel's either way. The count is the same on every TP rank (the ranks share
 the step's tokens). The drafter traces keep the sized op: the mask describes
 the target step's rows.
+
+With TPU_FUSED_OPROJ_AR a row-parallel per-channel FP8 layer served by the
+weight-streaming kernel (TPU_FP8_LINEAR_PALLAS) whose output this all-reduce
+would sum -- attention's o_proj -- takes ``row_parallel_or`` instead: one kernel
+for the matmul and the all-reduce (kernels/quantized_matmul/
+fp8_oproj_all_reduce.py), bitwise the two-call path, for blocks of at most
+16 rows inside the warmup. Everything else keeps the layer's own forward.
 """
 
 import jax
@@ -60,7 +67,14 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     reduce_scatter,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
+from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
 from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_N_ATTR,
+    FP8_PALLAS_WEIGHT,
+    KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -94,6 +108,9 @@ _CORES = 0
 _MESH_RANKS: tuple[int, ...] = ()
 # Whether the DP group is the mesh, so its combine may take the kernel.
 _DP_COMBINE = False
+# The fused row-parallel FP8 matmul + all-reduce (TPU_FUSED_OPROJ_AR); built only
+# when the TP group is the mesh (the only group it sums over).
+_MM_AR_OP = None
 
 
 def _build_all_reduce(mesh, psum_above: int | None = None):
@@ -164,6 +181,35 @@ def _build_valid_rows_all_reduce(mesh, tile_rows: int):
     )
 
 
+def _build_matmul_all_reduce(mesh, waves: bool):
+    """The fused op over ``mesh``: fn(x [rows, k] bf16, w [k, n] fp8, w_s [n] f32,
+    rank int32 [1]) per core -> the sum over the cores of x @ w * scales, [rows, n]."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(x, w, w_s, rank):
+        return fp8_oproj_all_reduce.fp8_matmul_all_reduce(
+            x, w, w_s, rank, num_cores=n, axis=EP_AXIS_NAME, waves=waves
+        )
+
+    def fn(x: jax.Array, w: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 4, out_specs=spec, check_vma=False
+        )(x, w, w_s, rank)
+
+    def fake(x, w, w_s, rank):
+        return x.new_empty((x.shape[0], w.shape[1]))
+
+    return sharded_jax_op(
+        "pallas::fp8_matmul_all_reduce",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 4,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
 def _build_reduce_scatter(mesh):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
@@ -195,7 +241,7 @@ def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
-    global _AR_VALID_OP, _VALID_TILE_ROWS
+    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -230,10 +276,12 @@ def prebuild() -> None:
     # is the mesh, DP rank r's rows go to mesh core r.
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
+    if envs.TPU_FUSED_OPROJ_AR and tp_all_reduce:
+        _MM_AR_OP = _build_matmul_all_reduce(mesh, envs.TPU_FUSED_OPROJ_AR_WAVES)
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | outside_warmup=%s | valid_rows=%s",
+        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -246,6 +294,7 @@ def prebuild() -> None:
         f"fold into {_VALID_TILE_ROWS}-row tiles (needs the token-padding mask)"
         if _AR_VALID_OP is not None
         else "off",
+        _MM_AR_OP is not None,
     )
 
 
@@ -335,3 +384,42 @@ def dp_combine_or(x: torch.Tensor, fallback) -> torch.Tensor:
     if x.shape[0] <= _CORES * COMBINE_MAX_ROWS:
         return _RS_OP(x, _RANK)
     return retain(fallback(x))
+
+
+def _fused_layer_weights(layer):
+    """(w [k, n] fp8, w_s [n] f32) when ``layer`` is a per-channel FP8 layer on the
+    weight-streaming kernel with the kernel's own weight (no padded copy, no
+    prequant slot, no bias) whose output is all-reduced over the TP group; else None."""
+    if (
+        getattr(layer, FP8_PALLAS_N_ATTR, None) is None
+        or getattr(layer, FP8_PALLAS_WEIGHT, None) is not None
+        or getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        or getattr(layer, PREQUANT_ATTR, None) is not None
+        or getattr(layer, "bias", None) is not None
+        or not getattr(layer, "reduce_results", False)
+        or getattr(layer, "tp_size", 1) != _CORES
+    ):
+        return None
+    w, w_s = layer.weight, getattr(layer, "weight_scale", None)
+    if w is None or w_s is None or w.dim() != 2 or w_s.dim() != 1:
+        return None
+    if w.dtype != torch.float8_e4m3fn or w_s.shape[0] != w.shape[1]:
+        return None
+    return w, w_s
+
+
+def row_parallel_or(x: torch.Tensor, layer) -> torch.Tensor:
+    """``layer(x)[0]`` for a row-parallel layer: the fused FP8 matmul + all-reduce
+    kernel for a decode block it supports (TPU_FUSED_OPROJ_AR), the layer's own
+    matmul and all-reduce otherwise. Both sides read the rank buffer (and the
+    padding mask), so the warmup's two traces lift the same buffers."""
+    if _MM_AR_OP is not None and _fits(x, LANES):
+        weights = _fused_layer_weights(layer)
+        if weights is not None:
+            w, w_s = weights
+            rows, k = x.shape
+            if k == w.shape[0] and fp8_oproj_all_reduce.supports(
+                rows, k, w.shape[1], _CORES
+            ):
+                return _MM_AR_OP(retain(x), w, w_s, _RANK)
+    return layer(x)[0]

@@ -277,6 +277,8 @@ def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draf
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", draft)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
+    # On by default (trial 5); its fused matmul + all-reduce op is covered below.
+    monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", False)
     for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK"):
         monkeypatch.setattr(op, name, None)
     monkeypatch.setattr(
@@ -460,3 +462,118 @@ def test_valid_rows_leaves_the_draft_traces_on_the_sized_op(
     monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
     assert op.all_reduce_or(_block(16), MESH, _fallback) is sized.return_value
     valid_rows.assert_not_called()
+
+
+# --- TPU_FUSED_OPROJ_AR: row_parallel_or ---------------------------------------------
+K_OPROJ, N_OPROJ = 1024, 6144
+
+
+class _RowParallel:
+    """A per-channel FP8 RowParallelLinear on the weight-streaming kernel."""
+
+    def __init__(self, k=K_OPROJ, n=N_OPROJ, **attrs):
+        from vllm_torchtpu.layers.adapter.linear_common import FP8_PALLAS_N_ATTR
+
+        self.weight = torch.zeros(k, n).to(torch.float8_e4m3fn)
+        self.weight_scale = torch.ones(n)
+        self.bias = None
+        self.reduce_results = True
+        self.tp_size = CORES
+        setattr(self, FP8_PALLAS_N_ATTR, n)
+        for name, value in attrs.items():
+            setattr(self, name, value)
+        self.calls = 0
+
+    def __call__(self, x):
+        self.calls += 1
+        return (x[:, :1].repeat(1, self.weight.shape[1]), None)
+
+
+@pytest.fixture
+def fused(armed, monkeypatch):
+    mm_ar = Mock(name="matmul_all_reduce_op")
+    monkeypatch.setattr(op, "_MM_AR_OP", mm_ar)
+    return mm_ar
+
+
+@pytest.mark.parametrize("rows", [1, 4, 8, 16])
+def test_decode_block_takes_the_fused_kernel(fused, rows):
+    layer = _RowParallel()
+    x = _block(rows, hidden=K_OPROJ)
+    assert op.row_parallel_or(x, layer) is fused.return_value
+    (block, w, w_s, rank), _ = fused.call_args
+    torch.testing.assert_close(block, x, rtol=0, atol=0)
+    assert w is layer.weight and w_s is layer.weight_scale and rank is op._RANK
+    assert layer.calls == 0
+
+
+@pytest.mark.parametrize(
+    "rows,layer",
+    [
+        (17, _RowParallel()),  # above the kernel's 16 rows
+        (4, _RowParallel(k=2048, n=16384)),  # not a measured shape
+        (4, _RowParallel(bias=torch.zeros(N_OPROJ))),
+        (4, _RowParallel(reduce_results=False)),
+        (4, _RowParallel(tp_size=CORES // 2)),  # TP group is not the mesh
+        (4, _RowParallel(weight_pallas=torch.zeros(1))),  # padded kernel copy
+        (4, _RowParallel(_tpu_keep_vllm_weight_layout=True)),
+        (4, _RowParallel(_tpu_prequant_slot=object())),
+    ],
+    ids=[
+        "rows17",
+        "shape",
+        "bias",
+        "no_reduce",
+        "tp_not_mesh",
+        "padded",
+        "vllm_layout",
+        "prequant",
+    ],
+)
+def test_other_blocks_keep_the_layer_forward(fused, rows, layer):
+    x = _block(rows, hidden=layer.weight.shape[0])
+    out = op.row_parallel_or(x, layer)
+    fused.assert_not_called()
+    assert layer.calls == 1
+    torch.testing.assert_close(out, layer(x)[0], rtol=0, atol=0)
+
+
+def test_not_fp8_pallas_keeps_the_layer_forward(fused):
+    from vllm_torchtpu.layers.adapter.linear_common import FP8_PALLAS_N_ATTR
+
+    layer = _RowParallel()
+    delattr(layer, FP8_PALLAS_N_ATTR)
+    op.row_parallel_or(_block(4, hidden=K_OPROJ), layer)
+    fused.assert_not_called()
+    assert layer.calls == 1
+
+
+def test_unarmed_or_outside_warmup_keeps_the_layer_forward(armed, monkeypatch):
+    layer = _RowParallel()
+    monkeypatch.setattr(op, "_MM_AR_OP", None)
+    op.row_parallel_or(_block(4, hidden=K_OPROJ), layer)
+    assert layer.calls == 1
+    mm_ar = Mock()
+    monkeypatch.setattr(op, "_MM_AR_OP", mm_ar)
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    op.row_parallel_or(_block(4, hidden=K_OPROJ), layer)
+    mm_ar.assert_not_called()
+    assert layer.calls == 2
+
+
+def test_fused_input_depends_on_the_rank_buffer(fused, monkeypatch):
+    """The fused side reads the rank buffer (retain), as the other side of the row fork
+    does, so both warmup traces lift the same buffers."""
+    monkeypatch.setattr(op, "_RANK", torch.tensor([float("nan")]))
+    op.row_parallel_or(_block(4, hidden=K_OPROJ), _RowParallel())
+    (block, *_), _ = fused.call_args
+    assert torch.isnan(block).all()
+
+
+def test_fused_flag_defaults_on(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_FUSED_OPROJ_AR", raising=False)
+    monkeypatch.delenv("TPU_FUSED_OPROJ_AR_WAVES", raising=False)
+    assert envs.environment_variables["TPU_FUSED_OPROJ_AR"]() is True
+    assert envs.environment_variables["TPU_FUSED_OPROJ_AR_WAVES"]() is True

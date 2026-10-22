@@ -1,5 +1,5 @@
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -12,6 +12,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -370,9 +371,13 @@ class VocabParallelArgmax:
     """This rank's slice of a vocab-parallel lm_head, for an argmax that
     all-gathers one (max, index) pair per row instead of the full logits."""
 
-    org_vocab_start: int  # global id of local column 0
+    # Global id of local column 0. An int, or (with_device_vocab_start) the
+    # same value as a device int32 scalar.
+    org_vocab_start: int | torch.Tensor
     num_org_local: int  # local columns that are real (not padding / added)
     tp_size: int
+    # TPU_MTP_ONEHOT_AR: bool [tp], True at this rank (data, not a constant).
+    slot: torch.Tensor | None = field(default=None, compare=False)
 
 
 def install_vocab_parallel_draft_argmax(
@@ -405,11 +410,59 @@ def install_vocab_parallel_draft_argmax(
         return None
     shard = heads[0].shard_indices
     lp._gather_logits = lambda logits: logits
+    tp_size = int(heads[0].tp_size)
+    slot = None
+    if envs.TPU_MTP_ONEHOT_AR:
+        slot = rank_slot(int(heads[0].tp_rank), tp_size, heads[0].weight.device)
     return VocabParallelArgmax(
         org_vocab_start=int(shard.org_vocab_start_index),
         num_org_local=int(shard.org_vocab_end_index - shard.org_vocab_start_index),
-        tp_size=int(heads[0].tp_size),
+        tp_size=tp_size,
+        slot=slot,
     )
+
+
+def with_device_vocab_start(info: VocabParallelArgmax, device) -> VocabParallelArgmax:
+    """`info` with its shard offset as a device int32 scalar.
+
+    For a program compiled once and shared across ranks (peer replay): an int
+    offset is a constant of the traced graph, different on every rank, so no
+    rank can replay another's artifact; a tensor is an input of it, like
+    `slot`. Same ids either way.
+    """
+    if isinstance(info.org_vocab_start, torch.Tensor):
+        return info
+    start = torch.tensor(int(info.org_vocab_start), dtype=torch.int32).to(device)
+    return replace(info, org_vocab_start=start)
+
+
+def rank_slot(tp_rank: int, tp_size: int, device) -> torch.Tensor:
+    """bool [tp_size], True only at ``tp_rank``: a device tensor, so the
+    program that reads it is the same on every rank."""
+    return (torch.arange(tp_size) == tp_rank).to(device)
+
+
+def onehot_all_gather(local: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
+    """[rows, n] per rank -> [rows, tp * n], rank r's block at columns
+    [r * n, (r + 1) * n): the TP all-gather, done as the TP all-reduce of a
+    zero buffer holding ``local`` in this rank's slot. Each element is one
+    rank's value plus tp - 1 zeros, so the sum is that value exactly (a -0
+    comes back +0). The all-reduce takes the small Pallas kernel where the
+    all-gather would take XLA's collective (TPU_SMALL_ALL_REDUCE_DRAFT, bf16,
+    tp * n a multiple of tp * 128)."""
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    rows, n = local.shape
+    tp = slot.shape[0]
+    buf = torch.where(
+        slot.view(1, tp, 1), local.unsqueeze(1), torch.zeros_like(local).unsqueeze(1)
+    )
+    return tensor_model_parallel_all_reduce(buf.reshape(rows, tp * n))
+
+
+# Per-rank slot width of the one-hot argmax exchange: (max, id bytes 2/1/0),
+# padded to one lane group so tp * width meets the small all-reduce's width.
+_ONEHOT_ARGMAX_W = 128
 
 
 def vocab_parallel_argmax(
@@ -435,6 +488,31 @@ def vocab_parallel_argmax(
         )
     local_idx = torch.argmax(local_logits, dim=-1, keepdim=True)
     local_max = torch.gather(local_logits, -1, local_idx)
+    if info.slot is not None and local_logits.dtype == torch.bfloat16:
+        # bf16 holds every bf16 logit and every integer up to 256, so the id
+        # rides as three base-256 digits (vocab < 2**24).
+        gid = (local_idx + info.org_vocab_start).to(torch.int32)
+        digits = torch.cat([gid // 65536, (gid // 256) % 256, gid % 256], dim=-1).to(
+            torch.bfloat16
+        )
+        payload = torch.cat(
+            [
+                local_max,
+                digits,
+                local_max.new_zeros((rows, _ONEHOT_ARGMAX_W - 4)),
+            ],
+            dim=-1,
+        )
+        g = onehot_all_gather(payload, info.slot).view(
+            rows, info.tp_size, _ONEHOT_ARGMAX_W
+        )
+        best_rank = torch.argmax(g[..., 0], dim=1, keepdim=True)
+        d = (
+            torch.gather(g[..., 1:4], 1, best_rank.unsqueeze(-1).expand(rows, 1, 3))
+            .view(rows, 3)
+            .to(torch.int32)
+        )
+        return d[:, 0] * 65536 + d[:, 1] * 256 + d[:, 2]
     # f32 holds every vocab id exactly (< 2**24) and every bf16 logit.
     pair = torch.cat(
         [local_max.float(), (local_idx + info.org_vocab_start).float()], dim=-1
@@ -470,6 +548,14 @@ class ColumnParallelEhProj(torch.nn.Module):
             weight.detach()[tp_rank * n : (tp_rank + 1) * n].clone(),
             requires_grad=False,
         )
+        # TPU_MTP_ONEHOT_AR: gather through a one-hot all-reduce.
+        self.register_buffer(
+            "slot",
+            rank_slot(tp_rank, tp_size, weight.device)
+            if envs.TPU_MTP_ONEHOT_AR
+            else None,
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from vllm.distributed import tensor_model_parallel_all_gather
@@ -478,6 +564,8 @@ class ColumnParallelEhProj(torch.nn.Module):
         lead = x.shape[:-1]
         local = torch.nn.functional.linear(x, self.weight).reshape(-1, n)
         rows = local.shape[0]
+        if self.slot is not None:
+            return onehot_all_gather(local, self.slot).reshape(*lead, self.out_features)
         gathered = tensor_model_parallel_all_gather(local, dim=0)
         return (
             gathered.view(self.tp_size, rows, n)

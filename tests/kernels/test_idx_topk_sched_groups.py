@@ -133,6 +133,9 @@ def _topk_group_ids(monkeypatch, group, chunk_tokens=256):
     """The id each `_sc_topk_direct` call of the decode-shaped DCP top-k gets,
     in call order, plus the exported module text."""
     seen = []
+    # The padded merge path these groups annotate (the flat merge, on by
+    # default since trial 5, takes its own call).
+    monkeypatch.setenv("TPU_SC_TOPK_DCP_MERGE_FLAT", "0")
     # A trace cached by an earlier call would skip the stub and record nothing.
     jax.clear_caches()
 

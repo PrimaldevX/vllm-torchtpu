@@ -165,6 +165,9 @@ def test_routing(flag, is_backbone, built, expect, monkeypatch):
     calls = []
     monkeypatch.setattr(cp_mla.envs, "TPU_MTP_DCP_MERGE_SIZED", flag, raising=False)
     monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
+    # The f32 reduce-scatter this stand-in takes (bf16 on the backbone is on by
+    # default since trial 5; covered in test_cp_mla_attention).
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", False, raising=False)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _Group())
 
     def sized_merge(o, lse):

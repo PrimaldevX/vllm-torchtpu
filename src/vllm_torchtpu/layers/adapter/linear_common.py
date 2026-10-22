@@ -14,7 +14,10 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -51,6 +54,26 @@ FP8_PALLAS_SCALE = "weight_scale_pallas"
 # TPU_IDX_TOPK_SCHED_GROUPS: the kernel's XLA scheduling group, on a DCP indexer
 # layer's q_b_proj (G2: it runs under the cross-rank SparseCore top-k).
 FP8_PALLAS_SCHED_GROUP_ATTR = "_tpu_fp8_pallas_sched_group"
+# TPU_FP8_SKINNY_HBM_PIN_SITES: set (True) on a layer whose kernel weight operand is
+# constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
+FP8_PALLAS_HBM_PIN_ATTR = "_tpu_fp8_pallas_hbm_pin"
+# TPU_FUSED_ADD_RMSNORM_QUANT: a per-channel FP8 linear paired with the
+# residual-stream norm in front of it holds a PrequantSlot under this attribute;
+# the norm holds the same slot. The norm's forward puts
+# `(x_q [m, k], x_scale f32 [m, 1])` in it and `apply` takes and clears it.
+PREQUANT_ATTR = "_tpu_prequant_slot"
+
+
+class PrequantSlot:
+    """A plain object shared by a norm and its linear, so the norm never holds
+    the linear module: Dynamo would otherwise reach the linear's weights
+    through the norm on one side of the token-count branch, and the two traces
+    would lift the same buffers under different names (no bucket handover)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = None
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -161,20 +184,84 @@ def quantized_matmul(
     return out_2d.reshape(orig_out_shape)
 
 
+_prequantized_matmul_op: Callable | None = None
+
+
+def _prequantized_matmul_jax(
+    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+def get_prequantized_matmul_op() -> Callable:
+    """TPU_FUSED_ADD_RMSNORM_QUANT consumer op (build outside Dynamo)."""
+    global _prequantized_matmul_op
+    if _prequantized_matmul_op is not None:
+        return _prequantized_matmul_op
+    with _quantized_matmul_kernel_op_lock:
+        if _prequantized_matmul_op is not None:
+            return _prequantized_matmul_op
+        op = pallas.jax_op("pallas::prequantized_matmul", _prequantized_matmul_jax)
+
+        def _fake(x_q, x_scale, w_q, w_s):
+            del x_scale, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[1], dtype=torch.bfloat16, device=x_q.device
+            )
+
+        op.register_fake(_fake)
+        _prequantized_matmul_op = op
+        return op
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor, x_scale: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """Per-channel FP8 linear on an activation quantized upstream:
+    bit for bit ``quantized_matmul(x, w_q, w_s)`` when ``(x_q, x_scale)`` is
+    ``quantize_tensor(x)`` (bf16 out). ``w_q`` is (k, n), ``w_s`` [n].
+
+    Runs inside the compiled forward, so it only reads the op that
+    ``get_prequantized_matmul_op`` built at arming (rmsnorm.arm_prequant):
+    Dynamo cannot trace the lock or the lazy construction."""
+    op = _prequantized_matmul_op
+    if op is None:
+        raise RuntimeError(
+            "prequantized_matmul op not built: call get_prequantized_matmul_op() "
+            "at load (rmsnorm.arm_prequant does)"
+        )
+    return op(x_q, x_scale, w_q, w_s)
+
+
 def _fp8_linear_pallas_jax(
     x: jax.Array,
     w_q: jax.Array,
     w_s: jax.Array,
     w_k: jax.Array | None = None,
     s_k: jax.Array | None = None,
+    *,
+    hbm_pin: bool = False,
 ) -> jax.Array:
     """`TPU_FP8_LINEAR_PALLAS` path: skinny (decode) rows go to the weight-streaming
     Pallas kernel, every other shape to `xla_quantized_matmul` on `(w_q, w_s)`.
 
     `(w_k, s_k)`, when given, is the kernel's zero-padded `[n_in, n_pad]` copy of a
     weight whose width is not a lane multiple; the kernel output is cut back to it.
+    `hbm_pin`: constrain the kernel's weight operand to HBM (fp8_skinny `hbm_pin`).
     """
-    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k)
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=hbm_pin)
+
+
+def _fp8_linear_pallas_hbm_pinned_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    """`_fp8_linear_pallas_jax` with the kernel's weight constrained to HBM
+    (TPU_FP8_SKINNY_HBM_PIN_SITES)."""
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=True)
 
 
 def _fp8_linear_pallas(
@@ -184,6 +271,7 @@ def _fp8_linear_pallas(
     w_k: jax.Array | None,
     s_k: jax.Array | None,
     scheduling_group_id: int | None = None,
+    hbm_pin: bool = False,
 ) -> jax.Array:
     n_out = w_q.shape[1]
     if w_k is None:
@@ -199,6 +287,7 @@ def _fp8_linear_pallas(
             n_logical=n_out,
             scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
             and fp8_skinny.scale_dma_applies(*kw.shape),
+            hbm_pin=hbm_pin,
         )
         if scheduling_group_id is not None:
             # Tags the op that produced `out`: the kernel itself only when no
@@ -215,7 +304,9 @@ def _fp8_linear_pallas(
     return xla_quantized_matmul(x, w_q, w_s)
 
 
-def _fp8_linear_pallas_grouped_jax(scheduling_group_id: int) -> Callable:
+def _fp8_linear_pallas_grouped_jax(
+    scheduling_group_id: int, hbm_pin: bool = False
+) -> Callable:
     """`_fp8_linear_pallas_jax` with the kernel in XLA scheduling group
     `scheduling_group_id` (`TPU_IDX_TOPK_SCHED_GROUPS`). The id is baked into
     the body rather than passed, so each id is its own op and lowering."""
@@ -227,21 +318,24 @@ def _fp8_linear_pallas_grouped_jax(scheduling_group_id: int) -> Callable:
         w_k: jax.Array | None = None,
         s_k: jax.Array | None = None,
     ) -> jax.Array:
-        return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, scheduling_group_id)
+        return _fp8_linear_pallas(
+            x, w_q, w_s, w_k, s_k, scheduling_group_id, hbm_pin=hbm_pin
+        )
 
     return _fp8_linear_pallas_grouped
 
 
-_fp8_linear_pallas_ops: dict[tuple[bool, int | None], Callable] = {}
+_fp8_linear_pallas_ops: dict[tuple[bool, int | None, bool], Callable] = {}
 
 
 def get_fp8_linear_pallas_op(
-    padded_copy: bool, scheduling_group_id: int | None = None
+    padded_copy: bool, scheduling_group_id: int | None = None, hbm_pin: bool = False
 ) -> Callable:
     """The cached torch op; build it outside Dynamo (load time), it takes a Lock.
 
-    A `scheduling_group_id` gets its own op (`TPU_IDX_TOPK_SCHED_GROUPS`)."""
-    key = (padded_copy, scheduling_group_id)
+    A `scheduling_group_id` gets its own op (`TPU_IDX_TOPK_SCHED_GROUPS`), and so
+    does `hbm_pin` (TPU_FP8_SKINNY_HBM_PIN_SITES)."""
+    key = (padded_copy, scheduling_group_id, hbm_pin)
     op = _fp8_linear_pallas_ops.get(key)
     if op is not None:
         return op
@@ -250,10 +344,12 @@ def get_fp8_linear_pallas_op(
         if op is not None:
             return op
         name = "pallas::fp8_linear_pallas" + ("_padded" if padded_copy else "")
-        fn = _fp8_linear_pallas_jax
+        fn = _fp8_linear_pallas_hbm_pinned_jax if hbm_pin else _fp8_linear_pallas_jax
         if scheduling_group_id is not None:
             name += f"_g{scheduling_group_id}"
-            fn = _fp8_linear_pallas_grouped_jax(scheduling_group_id)
+            fn = _fp8_linear_pallas_grouped_jax(scheduling_group_id, hbm_pin)
+        if hbm_pin:
+            name += "_hbm"
         op = pallas.jax_op(name, fn)
 
         def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, *rest):
@@ -272,10 +368,12 @@ def quantized_matmul_pallas(
     w_kernel: torch.Tensor | None = None,
     s_kernel: torch.Tensor | None = None,
     scheduling_group_id: int | None = None,
+    hbm_pin: bool = False,
 ) -> torch.Tensor:
     """Torch entry point for `TPU_FP8_LINEAR_PALLAS` (per-channel FP8, (k, n) weight).
     Same contract as `quantized_matmul`; `(w_kernel, s_kernel)` is the optional padded
-    kernel copy, `scheduling_group_id` the kernel's XLA scheduling group."""
+    kernel copy, `scheduling_group_id` the kernel's XLA scheduling group, `hbm_pin`
+    constrains the kernel's weight operand to HBM."""
     if x.shape[-1] != w_q.shape[0]:
         raise ValueError(
             f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
@@ -283,9 +381,11 @@ def quantized_matmul_pallas(
         )
     x_2d = x.reshape(-1, x.shape[-1])
     if w_kernel is None:
-        out_2d = get_fp8_linear_pallas_op(False, scheduling_group_id)(x_2d, w_q, w_s)
+        out_2d = get_fp8_linear_pallas_op(False, scheduling_group_id, hbm_pin)(
+            x_2d, w_q, w_s
+        )
     else:
-        out_2d = get_fp8_linear_pallas_op(True, scheduling_group_id)(
+        out_2d = get_fp8_linear_pallas_op(True, scheduling_group_id, hbm_pin)(
             x_2d, w_q, w_s, w_kernel, s_kernel
         )
     return out_2d.reshape(*x.shape[:-1], w_q.shape[1])

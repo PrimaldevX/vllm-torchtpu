@@ -84,6 +84,28 @@ def dcp_rank_operand(device: Any = None) -> Any:
     return t
 
 
+def dcp_lane_operand(device: Any = None) -> Any:
+    """This rank's lane, ``global_rank // dcp_size``, as an int32 ``[1]``
+    tensor: its index on the ``(lane, DCP)`` mesh's lane axis, which
+    ``dcp_rank_operand`` does not carry (`TPU_DCP_INDEXER_SMALL_AG`, whose
+    remote DMAs address a peer as ``(my lane, j)``). Passed like the rank
+    operand, under ``PartitionSpec(DCP_AXIS_NAME)``. Built once per device,
+    at op-build time."""
+    import torch
+    import torch.distributed as dist
+
+    if device is None:
+        device = torch.device("tpu")
+    key = f"lane:{device}"
+    t = _RANK_OPERANDS.get(key)
+    if t is None:
+        dcp_size = get_dcp_world_size()
+        rank = int(dist.get_rank()) if dist.is_initialized() else 0
+        t = torch.tensor([rank // max(dcp_size, 1)], dtype=torch.int32, device=device)
+        _RANK_OPERANDS[key] = t
+    return t
+
+
 def get_dcp_world_size() -> int:
     group = get_dcp_group()
     return 1 if group is None else int(group.world_size)

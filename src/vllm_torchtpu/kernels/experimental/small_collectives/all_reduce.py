@@ -158,9 +158,15 @@ def _twoshot(x, n, axis, rank, collective_id):
 
 def fold_geometry(rows, hidden, num_cores, tile_rows):
     """(k, fold_rows) of the fold path, or None when it does not exist: k lane
-    groups per owner chunk (>= 2), fold_rows = tile_rows // k (>= 1)."""
+    groups per owner chunk (>= 2), fold_rows = tile_rows // k (>= 1).
+
+    The rows test is the cap rule's `rows > tile_rows // 2` (tile_rows is the
+    bf16 sublane tiling, a power of 2): on the power-of-2 bucket ladder it is
+    exactly `rows >= tile_rows`, but as a torch guard on a traced token count
+    it never touches an upper cap at tile_rows (`T <= 16` and `T >= 16` in one
+    trace pin the token count: the a2a merge cap 16 crash)."""
     own = hidden // num_cores
-    if own % LANES or rows < tile_rows:
+    if own % LANES or not rows > tile_rows // 2:
         return None
     k = own // LANES
     fold_rows = tile_rows // k
@@ -302,6 +308,7 @@ def small_all_reduce_valid_rows(
     rows, hidden = x.shape
     if (
         hidden % (num_cores * LANES)
+        or rows < tile_rows
         or fold_geometry(rows, hidden, num_cores, tile_rows) is None
     ):
         raise ValueError(

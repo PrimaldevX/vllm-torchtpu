@@ -225,6 +225,10 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
     chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
+    # > 0: page-major block [seq_batch, bkv_p * groups, packing, page_size];
+    # page i fills sublane groups [i * groups, (i + 1) * groups), one
+    # contiguous copy. 0: pages side by side on the lane axis.
+    page_major_groups: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -240,6 +244,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        page_major_groups: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -251,6 +256,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             use_lookahead=use_lookahead,
         )
         return cls(
+            page_major_groups=page_major_groups,
             bkv_p=bkv_p,
             page_size=page_size,
             pages_per_seq=pages_per_seq,
@@ -275,6 +281,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        page_major_groups: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -289,6 +296,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
             chunk_idx=chunk_idx,
+            page_major_groups=page_major_groups,
         )
 
     def copy_in(  # pytype: disable=attribute-error
@@ -324,17 +332,20 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
                 # [i * page_size, (i + 1) * page_size) of the block. The offset is a
                 # compile-time constant and page_size is a multiple of the lane count,
                 # so the destination slice is always tile aligned.
-                dst_lane_start = i * self.page_size
-                pltpu.make_async_copy(
-                    cache_kv_hbm.at[safe_page],
-                    vmem_dst.at[  # pytype: disable=attribute-error
+                if self.page_major_groups:
+                    g = self.page_major_groups
+                    dst = vmem_dst.at[  # pytype: disable=attribute-error
+                        batch_idx, pl.ds(i * g, g), :, :
+                    ]
+                else:
+                    dst_lane_start = i * self.page_size
+                    dst = vmem_dst.at[  # pytype: disable=attribute-error
                         batch_idx,
                         :,
                         :,
                         pl.ds(dst_lane_start, self.page_size),
-                    ],
-                    sem,
-                ).start()
+                    ]
+                pltpu.make_async_copy(cache_kv_hbm.at[safe_page], dst, sem).start()
 
     def wait_in(
         self,

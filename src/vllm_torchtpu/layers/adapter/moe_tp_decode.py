@@ -36,6 +36,8 @@ runs the steps of more than FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens through
 kernels/experimental/fused_moe_prefill (routed and shared experts, combine and
 all-reduce) instead of the usual path and a psum: the same kernel and the same
 cut-over as under FUSED_MOE_DECODE_KERNEL, which this op stands down for.
+FUSED_MOE_PREFILL_KERNEL_V2 swaps in its stage-A build (per-row activation
+scales) where the layer's experts fit whole.
 """
 
 import dataclasses
@@ -55,7 +57,13 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
-from vllm_torchtpu.kernels.experimental.fused_moe_prefill import fused_moe_prefill
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+    fused_moe_prefill,
+    plan_blocks,
+)
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    fused_moe_prefill_stage_a,
+)
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
@@ -70,6 +78,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _OP_ATTR = "_moe_tp_decode_op"
+# TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the op variant that also takes the norm's fp8
+# rows and scales (set by rmsnorm.arm_prequant_moe), and the slot it reads them
+# from on the FusedMoE layer.
+_OP_PREQUANT_ATTR = "_moe_tp_decode_op_prequant"
+PREQUANT_MOE_ATTR = "_tpu_prequant_moe_slot"
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -92,6 +105,8 @@ _PREFILL_Q_BLOCK = 512
 _OPS: dict[tuple, Any] = {}
 _SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
 _RANK_BUFFER: torch.Tensor | None = None
+# TPU_MOE_TP_DECODE_SHARED_META: one experts_start buffer per (device, value).
+_E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
 _SELFTEST_DONE = False
 
 
@@ -117,6 +132,11 @@ class _OpStatics:
     # FUSED_MOE_PREFILL_KERNEL on a TP-expert layer: token counts above this
     # run the fused MoE prefill kernel instead of the psum path. None = off.
     prefill_above: int | None = None
+    # TPU_MOE_TP_DECODE_FAST: the kernel's fast schedule (same output bits).
+    fast: bool = False
+    # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
+    # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
+    hbm_operands: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,6 +352,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             and hidden % _PREFILL_Q_BLOCK == 0
             else None
         ),
+        fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
     )
     return _Admitted(
         shared=shared,
@@ -342,10 +363,10 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     )
 
 
-def _route(scores, bias, is_pad, st, dtype):
-    """select_experts as the unarmed path runs it: ids from the biased scores,
-    the picked unbiased scores renormalized and rounded to `dtype`, and
-    zero_routing_weights_for_padding."""
+def _route(x, scores, bias, is_pad, st):
+    """select_experts as the unarmed path runs it (ids from the biased scores,
+    renormalized unbiased weights in bf16), then
+    zero_routing_weights_for_padding: (weights, ids)."""
     bias = bias.astype(jnp.float32)
     if st.router_bias:
         w, ids = router_select_bias(scores, bias[None, :], st.topk)
@@ -355,23 +376,55 @@ def _route(scores, bias, is_pad, st, dtype):
     total = jnp.sum(w, axis=-1, keepdims=True)
     # torch.clamp(min=1e-20) keeps NaN; a fused jnp.maximum may not (XLA CPU).
     total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
-    w = (w / total).astype(dtype)
-    return jnp.where(is_pad[:, None], jnp.zeros_like(w), w), ids
+    w = (w / total).astype(x.dtype)
+    w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
+    return w, ids
 
 
 def _prefill_chain(
-    x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, axis
+    x,
+    scores,
+    bias,
+    is_pad,
+    w13,
+    w2,
+    s13,
+    s2,
+    sw13,
+    ss13,
+    sw2,
+    ss2,
+    st,
+    axis,
+    x_q=None,
+    x_scale=None,
 ):
     """The layer's output, summed over `axis`, from the fused MoE prefill
     kernel (FUSED_MOE_PREFILL_KERNEL) on this op's routing, as
     fused_moe_decode's prefill path calls it. GLM-5.2's shared expert is
-    ungated; routed_scale is folded into the route weights by the kernel."""
+    ungated; routed_scale is folded into the route weights by the kernel.
+    FUSED_MOE_PREFILL_KERNEL_V2: the stage-A build (per-row activation scales)
+    where the experts fit whole. `x_q` / `x_scale` (TPU_FUSED_ADD_RMSNORM_QUANT_MOE):
+    x's per-row fp8 rows and scales from the norm, which the stage-A build
+    takes in place of its own quantization; the default build (512-column
+    scales) quantizes x itself."""
+    prefill = fused_moe_prefill
+    if envs.FUSED_MOE_PREFILL_KERNEL_V2 and (
+        plan_blocks(x.shape[0], x.shape[1], w2.shape[1], sw2.shape[0], w13.dtype)
+        is None
+    ):
+        prefill = fused_moe_prefill_stage_a
     # Trace-time, once per token bucket: the evidence that the kernel serves it.
     logger.info(
-        "moe_tp_decode: fused MoE prefill kernel traced for %d tokens", x.shape[0]
+        "moe_tp_decode: fused MoE prefill kernel%s traced for %d tokens",
+        " (V2, stage A)" if prefill is fused_moe_prefill_stage_a else "",
+        x.shape[0],
     )
-    w, ids = _route(scores, bias, is_pad, st, x.dtype)
-    return fused_moe_prefill(
+    w, ids = _route(x, scores, bias, is_pad, st)
+    prequant = {}
+    if x_q is not None and prefill is fused_moe_prefill_stage_a:
+        prequant = {"x_q": x_q, "x_scale": x_scale}
+    return prefill(
         x,
         w13,
         w2,
@@ -387,19 +440,18 @@ def _prefill_chain(
         axis_name=axis,
         expert_start=None,
         routed_scale=st.routed_scale,
+        **prequant,
     )
 
 
 def _tp_chain(
     x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0=None
 ):
-    """This rank's partial as the unarmed path computes it: select_experts
-    (ids from the biased scores, renormalized unbiased weights in bf16),
-    zero_routing_weights_for_padding, fused_moe_func (under EP with
-    experts_start e0, so the SparseCore EP dispatch and combine), the shared
-    expert's two quantized linears around SiluAndMul, and shared + scale *
-    routed in bf16."""
-    w, ids = _route(scores, bias, is_pad, st, x.dtype)
+    """This rank's partial as the unarmed path computes it: _route,
+    fused_moe_func (under EP with experts_start e0, so the SparseCore EP
+    dispatch and combine), the shared expert's two quantized linears around
+    SiluAndMul, and shared + scale * routed in bf16."""
+    w, ids = _route(x, scores, bias, is_pad, st)
     routed = fused_moe_func(
         x,
         w13,
@@ -432,7 +484,21 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     and a psum."""
 
     def body(
-        x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0
+        x,
+        scores,
+        bias,
+        pad_mask,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
+        *prequant,
     ):
         n = x.shape[0]  # static: torch_tpu exports one program per token count
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
@@ -462,6 +528,8 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     routed_scale=statics.routed_scale,
                     topk=statics.topk,
                     n_ranks=n_ranks,
+                    fast=statics.fast,
+                    hbm_operands=statics.hbm_operands,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -477,10 +545,12 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 routed_scale=statics.routed_scale,
                 topk=statics.topk,
                 n_ranks=n_ranks,
+                fast=statics.fast,
+                hbm_operands=statics.hbm_operands,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(
-                x, scores, bias, is_pad, *weights, statics, axis
+                x, scores, bias, is_pad, *weights, statics, axis, *prequant
             ).astype(x.dtype)
         partial = _tp_chain(x, scores, bias, is_pad, *weights, statics, e0.reshape(()))
         return lax.psum(partial, axis)
@@ -488,21 +558,28 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     return body
 
 
-def _get_op(mesh, statics: _OpStatics):
-    """One jax_op per distinct closure; built at arming, never in a trace."""
-    key = (mesh, statics)
+def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
+    """One jax_op per distinct closure; built at arming, never in a trace.
+    `prequant`: the variant with two more per-rank operands, x_q [T, h/128,
+    128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE)."""
+    key = (mesh, statics, prequant)
     op = _OPS.get(key)
     if op is not None:
         return op
     axis = mesh.axis_names[0]
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
-    specs = (P(axis), P(axis), P(), P()) + (P(axis),) * 10
+    specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
     body = _op_body(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
         body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
     )
+
+    def run(*args):
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
 
     # torch_tpu reads the operand types from these annotations.
     def fn(
@@ -521,7 +598,29 @@ def _get_op(mesh, statics: _OpStatics):
         rank: jax.Array,
         e0: jax.Array,
     ) -> jax.Array:
-        args = (
+        return run(
+            x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0
+        )
+
+    def fn_prequant(
+        x: jax.Array,
+        scores: jax.Array,
+        bias: jax.Array,
+        pad_mask: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        s13: jax.Array,
+        s2: jax.Array,
+        sw13: jax.Array,
+        ss13: jax.Array,
+        sw2: jax.Array,
+        ss2: jax.Array,
+        rank: jax.Array,
+        e0: jax.Array,
+        x_q: jax.Array,
+        x_scale: jax.Array,
+    ) -> jax.Array:
+        return run(
             x,
             scores,
             bias,
@@ -536,17 +635,20 @@ def _get_op(mesh, statics: _OpStatics):
             ss2,
             rank,
             e0,
-        )
-        return sharded(
-            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+            x_q,
+            x_scale,
         )
 
     name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
     # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
-    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
+    # jax_op takes PartitionSpecs at runtime, as main's other call sites pass them.
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=P(axis)
+        name,
+        fn_prequant if prequant else fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
     )
     # vLLM traces with a dynamic token dimension; rows in == rows out.
     op.register_fake(lambda x, *args, **kwargs: torch.empty_like(x))
@@ -599,6 +701,20 @@ def _rank_tensor(device: torch.device, mesh_index: int) -> torch.Tensor:
     return _RANK_BUFFER
 
 
+def _e0_tensor(device: torch.device, experts_start: int) -> torch.Tensor:
+    """experts_start as int32 [1, 1] data. TPU_MOE_TP_DECODE_SHARED_META: one
+    tensor per value, shared by every layer, so each layer's meta stack is the
+    same HLO value and CSE keeps one; else a fresh tensor per layer."""
+    if not envs.TPU_MOE_TP_DECODE_SHARED_META:
+        return torch.tensor([[experts_start]], dtype=torch.int32, device=device)
+    key = (str(device), int(experts_start))
+    t = _E0_BUFFERS.get(key)
+    if t is None:
+        t = torch.tensor([[experts_start]], dtype=torch.int32, device=device)
+        _E0_BUFFERS[key] = t
+    return t
+
+
 def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
     """Run the kernel's all-reduce alone for every armed (rows, hidden) and row
     path through the op's mesh and rank operand; returns this rank's failing
@@ -649,6 +765,19 @@ def _check_ranks_agree(entry: dict) -> None:
             f"moe_tp_decode: TP ranks disagree ({'; '.join(problems)}); their "
             f"programs and the kernel's barrier would not match. Per rank: {seen}"
         )
+
+
+def should_arm() -> bool:
+    """Whether load_model should call `arm` at all.
+
+    USE_MOE_TP_DECODE_KERNEL is on by default, and without
+    TPU_MOE_SKIP_PADDED_TOKENS every layer refuses (the op reads n_valid from
+    the padding mask), so the default skips arming and its collectives there.
+    An explicit setting still arms and logs why each layer was refused.
+    """
+    if not envs.USE_MOE_TP_DECODE_KERNEL:
+        return False
+    return envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.is_set("USE_MOE_TP_DECODE_KERNEL")
 
 
 def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> int:
@@ -710,17 +839,29 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         bias = layer.e_score_correction_bias.detach().to(torch.float32).contiguous()
         rank = _rank_tensor(layer.w13_weight.device, topo.mesh_index)
         # [1, 1] like the rank: per-rank data, one program on every rank.
-        e0 = torch.tensor(
-            [[adm.experts_start]], dtype=torch.int32, device=layer.w13_weight.device
-        )
+        e0 = _e0_tensor(layer.w13_weight.device, adm.experts_start)
         for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank, e0)):
             layer.register_buffer(name, tensor, persistent=False)
-        setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, adm.statics))
+        statics = adm.statics
+        # TPU_MOE_TP_DECODE_HBM_OPERANDS: "drafter" (MTP layer only) or "all".
+        mode = envs.TPU_MOE_TP_DECODE_HBM_OPERANDS
+        if mode not in ("", "0", "drafter", "all"):
+            raise ValueError(
+                f"TPU_MOE_TP_DECODE_HBM_OPERANDS={mode!r}: use '', 'drafter' or 'all'"
+            )
+        if mode == "all" or (mode == "drafter" and id(runner) not in known):
+            statics = dataclasses.replace(statics, hbm_operands=True)
+        setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, statics))
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
     armed_drafter = sum(1 for r, _ in plan if id(r) not in known)
-    log = logger.info if plan else logger.warning
+    # On by default, so a model it does not serve is the common case there.
+    log = (
+        logger.info
+        if plan or not envs.is_set("USE_MOE_TP_DECODE_KERNEL")
+        else logger.warning
+    )
     log(
         "moe_tp_decode: armed %d/%d target and %d/%d drafter MoE layers (mesh "
         "index %d, kernel token counts %s, sig %s); refused: %s",
@@ -746,7 +887,19 @@ def moe_tp_decode_forward(
     sw13, ss13, sw2, ss2, bias, rank, e0 = (getattr(layer, n) for n in _BUFFERS)
     # The usual path's scoring function; everything after it is the op.
     scores = moe_routing._apply_scoring_fn(layer.scoring_func, router_logits)
-    return getattr(quant_method, _OP_ATTR)(
+    # TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the norm that produced `x` filled the slot
+    # only on its Pallas (prefill-sized) branch, so this is not a token-count
+    # branch of its own; the rows are the stage-A kernel's own quantization,
+    # bit for bit.
+    slot = getattr(layer, PREQUANT_MOE_ATTR, None)
+    prequant = None if slot is None else slot.value
+    op = getattr(quant_method, _OP_ATTR)
+    extra: tuple = ()
+    if slot is not None and prequant is not None:
+        slot.value = None
+        op = getattr(quant_method, _OP_PREQUANT_ATTR)
+        extra = tuple(prequant)
+    return op(
         x,
         scores,
         bias,
@@ -761,4 +914,26 @@ def moe_tp_decode_forward(
         ss2,
         rank,
         e0,
+        *extra,
     )
+
+
+def arm_prequant_op(layer: Any) -> int | None:
+    """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: build (at load, outside Dynamo) the
+    prequant variant of an armed layer's op. Returns the token count above
+    which its prefill kernel runs (`prefill_above`), or None when the layer is
+    not armed, has no prefill kernel, or FUSED_MOE_PREFILL_KERNEL_V2 is off
+    (only the stage-A build takes per-row rows: nothing to pair)."""
+    if not envs.FUSED_MOE_PREFILL_KERNEL_V2:
+        return None
+    op = getattr(layer.quant_method, _OP_ATTR, None)
+    if op is None:
+        return None
+    entry = next(((k, v) for k, v in _OPS.items() if v is op), None)
+    if entry is None:
+        return None
+    (mesh, statics, prequant), _ = entry
+    if prequant or statics.prefill_above is None:
+        return None
+    setattr(layer.quant_method, _OP_PREQUANT_ATTR, _get_op(mesh, statics, True))
+    return statics.prefill_above

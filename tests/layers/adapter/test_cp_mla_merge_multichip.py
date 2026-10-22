@@ -86,6 +86,11 @@ _ARM_DEFAULTS = {
     "TPU_DCP_LSE_MERGE_A2A_PACK": False,
     "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": False,
     "TPU_DCP_MERGE_RS_BF16": 0,
+    # Trial-4 merge flags, on by default since trial 4 but not what these arms
+    # compare: CHUNKED_SMALL would split chunk8_ag1's bucket into 2 chunks.
+    "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
+    "TPU_DCP_MLA_MERGE_PIECES": 0,
+    "TPU_DCP_MERGE_WEIGHTED_HM": False,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {

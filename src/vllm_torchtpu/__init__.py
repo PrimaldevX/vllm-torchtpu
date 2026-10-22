@@ -1978,39 +1978,45 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
 
     original_init = vpe.VocabParallelEmbedding.__init__
 
+    from vllm_torchtpu import envs as _envs
+
+    # TPU_VOCAB_EMBED_I32_BOUNDS: int32 bounds (no X64SplitLow per program
+    # input); same values, every bound is < 2**31.
+    bound_dtype = torch.int32 if _envs.TPU_VOCAB_EMBED_I32_BOUNDS else torch.int64
+
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         if not hasattr(self, "org_vocab_start_index"):
             self.register_buffer(
                 "org_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.org_vocab_start_index, dtype=bound_dtype
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
+                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=bound_dtype),
                 persistent=False,
             )
             self.register_buffer(
                 "num_org_vocab_padding",
                 torch.tensor(
-                    self.shard_indices.num_org_vocab_padding, dtype=torch.int64
+                    self.shard_indices.num_org_vocab_padding, dtype=bound_dtype
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_start_index, dtype=bound_dtype
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_end_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_end_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_end_index, dtype=bound_dtype
                 ),
                 persistent=False,
             )

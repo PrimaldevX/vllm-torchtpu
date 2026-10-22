@@ -203,7 +203,8 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
             pl.BlockSpec(memory_space=pltpu.HBM)
             if scale_dma
             else pl.BlockSpec((1, n), lambda g, idx: (0, 0)),
-            # W [s, k, n], pinned to HBM (MSA cannot move it into VMEM).
+            # W [s, k, n] as an HBM ref in the kernel. This alone does not stop
+            # XLA staging the operand in VMEM first; see `hbm_pin`.
             pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         out_specs=pl.BlockSpec((m, n), lambda g, idx: (0, 0)),
@@ -227,9 +228,11 @@ def fp8_skinny_matmul(
     n_logical: int | None = None,
     config: tuple[str, int, int] | None = None,
     scale_dma: bool = False,
+    hbm_pin: bool = False,
 ) -> jax.Array:
     """x [m<=16, k] bf16, w_q fp8 [k, n] with n % 128 == 0, w_s f32 [n]
-    -> [m, n_logical or n] in x.dtype. `scale_dma`: see `fp8_skinny_matmul_stacked`."""
+    -> [m, n_logical or n] in x.dtype. `scale_dma`, `hbm_pin`: see
+    `fp8_skinny_matmul_stacked`."""
     return fp8_skinny_matmul_stacked(
         x,
         w_q[None],
@@ -238,19 +241,32 @@ def fp8_skinny_matmul(
         n_logical=n_logical,
         config=config,
         scale_dma=scale_dma,
+        hbm_pin=hbm_pin,
     )
 
 
-@functools.partial(jax.jit, static_argnums=0)
-def _call_scale_in_hbm(call, idx, x, w_s, w_stack):
-    # The constraint sets the scale operand's aval memory space, which pallas_call
-    # lowers to the custom call's `input_memory_space_colors` (HBM = 0). It only
-    # binds a pallas_call input and cannot run eagerly, hence the jit around both.
-    return call(idx, x, pltpu.with_memory_space_constraint(w_s, pltpu.HBM), w_stack)
+@functools.partial(jax.jit, static_argnums=(0, 5, 6))
+def _call_constrained(call, idx, x, w_s, w_stack, scale_hbm, weight_hbm):
+    # The constraint sets the operand aval's memory space, which pallas_call lowers
+    # to the custom call's `input_memory_space_colors` (HBM = 0). It only binds a
+    # pallas_call input and cannot run eagerly, hence the jit around both.
+    if scale_hbm:
+        w_s = pltpu.with_memory_space_constraint(w_s, pltpu.HBM)
+    if weight_hbm:
+        w_stack = pltpu.with_memory_space_constraint(w_stack, pltpu.HBM)
+    return call(idx, x, w_s, w_stack)
 
 
 def fp8_skinny_matmul_stacked(
-    x, w_stack, idx, w_s, *, n_logical=None, config=None, scale_dma=False
+    x,
+    w_stack,
+    idx,
+    w_s,
+    *,
+    n_logical=None,
+    config=None,
+    scale_dma=False,
+    hbm_pin=False,
 ):
     """As `fp8_skinny_matmul`; the kernel reads the weight from `w_stack[idx[0]]`.
 
@@ -260,14 +276,21 @@ def fp8_skinny_matmul_stacked(
     its memory-space assignment places one instruction before the call, exposing the
     DMA issue latency (~0.8 us) every layer. Same values, same arithmetic:
     bit-identical outputs.
+
+    `hbm_pin` (TPU_FP8_SKINNY_HBM_PIN_SITES): constrain the weight operand to HBM.
+    The in_spec's `memory_space=HBM` only types the ref inside the kernel; XLA's
+    memory-space assignment reads the operand's aval, so without this it may stage
+    the weight into VMEM with a copy before the call (whose wait is exposed when
+    nothing long runs between the copy's start and the call). Same kernel, same
+    arithmetic: bit-identical outputs.
     """
     m, k = x.shape
     n_stack, _, n = w_stack.shape
     split, t, nbuf = config or pick_config(k, n)
     call = _build(m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf, scale_dma)
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)
-    if scale_dma:
-        out = _call_scale_in_hbm(call, idx, x, w_s2, w_stack)
+    if scale_dma or hbm_pin:
+        out = _call_constrained(call, idx, x, w_s2, w_stack, scale_dma, hbm_pin)
     else:
         out = call(idx, x, w_s2, w_stack)
     if n_logical is not None and n_logical != n:

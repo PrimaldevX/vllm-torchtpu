@@ -1399,12 +1399,163 @@ def rope_q_block(x: jax.Array, tab: jax.Array, fault: str | None = None) -> jax.
     return jnp.where(lane < 64, r, 0.0).astype(x.dtype)
 
 
-MIXED_BODY_LEVERS = ("tr", "zu", "pv512", "noinf", "pbf16")
+MIXED_BODY_LEVERS = (
+    "tr",
+    "zu",
+    "pv512",
+    "noinf",
+    "pbf16",
+    # Stage-A levers (TPU_DCP_MLA_MIXED_KERNEL_V2), documented at
+    # `_attention_kernel`.
+    "fxskip",
+    "q128",
+    "pair",
+    "xqk",
+)
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
+# Decode body levers (`decode_body_levers`, TPU_MLA_DECODE_BODY_LEVERS): the
+# bitwise mixed-body levers on the decode (row-widths) body, plus "nofill" --
+# with the kernel-owned lse on a bucket one grid step covers whole (tokens <=
+# batch size, no send layout), the step's own lse store defines every row, so
+# the sentinel fill DMA (and its wait) runs only when there is no work.
+DECODE_BODY_LEVERS = (
+    "tr",
+    "zu",
+    "pv512",
+    "noinf",
+    "pair",
+    "fxskip",
+    "q128",
+    "nofill",
+    # "quad": all of a step's tokens in one stacked [bz * heads, w] softmax
+    # (row max / exp / sum per row, exactly as per token), their unpacked KV
+    # staged in VMEM for the PVs that follow (one group per grid step).
+    "quad",
+    # "lrows": each token's KV fetch moves only its live rows (kv_len rounded
+    # up to 32, at least 32, at most the step's width) instead of the step's
+    # width; the rows past kv_len are zeroed and masked either way.
+    "lrows",
+    # "step8": the attention grid walks DECODE_STEP8_TOKENS tokens per step
+    # (largest divisor of the chunk) while the window prep and the SparseCore
+    # gather keep the small-chunk batch: fewer, larger grid steps, and the
+    # gather still writes only the real tokens' batches. A step that runs past
+    # the real tokens reads unwritten tiles for the padding tokens, whose
+    # kv_len is 0 -- every key is zeroed and masked, so they attend nothing.
+    "step8",
+)
+DECODE_STEP8_TOKENS = 8
+# The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
+# attention grid step and "quad" stacks them in one softmax; "nofill" and
+# "q128" measured no gain.
+DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows", "step8")
+# The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
+# "q128" is not among them: at 32 q heads it slowed the capped-overflow
+# fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
+MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
 # Buckets up to this many tokens keep the plain live body: at 64 tokens the
 # levers measured within noise to +2.5 % (partly filled bucket).
 MIXED_BODY_MAX_SKIP_TOKENS = 64
+
+# TPU_DCP_MLA_SEND_LAYOUT: the decode kernel writes the DCP merge's packed
+# real-rows all-to-all send buffer itself. Each of the `world` destination
+# blocks is `SEND_PAD_ROWS + T * L` rows of `V` int16 words (`L = heads //
+# world`): rows `[0, SEND_PAD_ROWS - 1)` are never sent, row
+# `SEND_PAD_ROWS - 1` is the destination's lse word row (hi halves of its
+# `T * L` lse bit patterns, then the lo halves, then zeros -- exactly the
+# packed merge's lse row) and row `SEND_PAD_ROWS + t * L + l` is head
+# `d * L + l` of token t. The pad is one 16-bit sublane tile, so every grid
+# step's partial rows start on a tile and the lse row sits just ahead of them:
+# the exchange sends one contiguous range `[SEND_PAD_ROWS - 1, SEND_PAD_ROWS +
+# n_real * L)` per destination.
+SEND_PAD_ROWS = 16
+# Test-only faults for the send layout (positive controls).
+SEND_FAULTS = (None, "send_dest_rotate", "send_lse_lo_skip")
+
+# TPU_MLA_FUSED_SMALL_A2A (`send_exchange`, send layout on a one-step grid):
+# the kernel also runs the DCP exchange `small_all_to_all` would run on its
+# send buffer. It signals the barrier to every peer at entry, builds each
+# destination's block in a VMEM slab of `SEND_SLAB_ROW0 + T * L` rows (row
+# `SEND_SLAB_ROW0 - 1` the lse word row, then the partial rows) and pushes
+# slab d once into rows `[me * block + SEND_SLAB_ROW0, (me + 1) * block)` of
+# rank d's output, which is therefore the receive buffer `[W * block, V]`
+# (block = SEND_PAD_ROWS + T * L) bit for bit as small_all_to_all leaves it
+# (row0 = SEND_SLAB_ROW0); rows before that in each block stay unwritten.
+# The slab starts on a VMEM tile, so no unaligned VMEM slice is DMA'd.
+SEND_SLAB_ROW0 = SEND_PAD_ROWS // 2
+# Barrier semaphore group, distinct from the fused MoE kernels (0), the
+# small all-reduces (5), reduce-scatter (7), all-gather (9), all-to-all (11).
+SEND_EXCHANGE_COLLECTIVE_ID = 13
+# Scoped VMEM of the fused-exchange call (one decode grid step: a few MiB of
+# KV / q / slab buffers). The default limit reserves all of VMEM for the call,
+# so XLA can neither keep the receive buffer in VMEM for the unpack nor run
+# its prefetch copies under the call -- the cover the separate all-to-all
+# call used to give them (served mirror: +4.8 us per layer of exposed glue).
+SEND_EXCHANGE_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+# ... and its array operands are pinned to HBM: with VMEM no longer all
+# reserved, XLA would otherwise stage the gathered KV (the call's largest
+# inputs, which the kernel DMAs itself) into VMEM with exposed copies right
+# before the call (served mirror: +3.5 us per layer at T = 4, more at T = 8).
+# Which operands are pinned is a per-bucket choice (`send_exchange[3]`): all,
+# none, or these roles -- "kv" (the gathered KV / live views), "q", "q_pe",
+# "tab" (the q rope table), "recv" (the aliased receive-buffer input).
+SEND_EXCHANGE_PIN_ROLES = ("kv", "q", "q_pe", "tab", "recv")
+# Test-only: positive controls (misrouted / dropped peer block) and timing-
+# only removal arms (the round replaced by local copies; the barrier waited
+# at entry instead of after the body) of the fused exchange.
+SEND_EXCHANGE_FAULTS = (
+    "send_peer_misorder",
+    "send_peer_drop",
+    "send_xchg_rm_round",
+    "send_xchg_entry_wait",
+    # Merge mode only: the merge's w_lo sum dropped (a ~2^-9 relative error).
+    "send_merge_lo_skip",
+)
+# TPU_MLA_FUSED_SMALL_A2A_MERGE (`send_exchange[4]`): peers push their slabs
+# into a VMEM receive scratch [W, SEND_SLAB_ROW0 + T * L, V] int16 of this
+# rank (remote VMEM destination, not HBM) and the kernel merges the W
+# partials itself -- the unpack and torch's `_merge_received`, term by term --
+# into the second output, int16 [T * L, V] (the bf16 merge's words). The
+# real-token count rides the bounds prefetch after (rank, lane).
+
+
+def send_layout_lanes(num_tokens: int, num_heads: int, world: int) -> int:
+    """Lane width of the in-kernel lse word build: hi words at lanes
+    `[0, T * L)`, lo words at `[T * L, 2 * T * L)`, block-reversed source
+    rows at `[0, heads)` and `[T * L, T * L + heads)`."""
+    rows = num_tokens * (num_heads // world)
+    return align_to(max(2 * rows, rows + num_heads), 128)
+
+
+def send_layout_supported(
+    num_tokens: int, num_heads: int, world: int, vdim: int, batch_size: int
+) -> bool:
+    """Whether the kernel can write the send buffer for this geometry: one lse
+    word row per destination (`2 * T * L <= V`), a power-of-two `L`, and grid
+    steps whose `batch_size * L` partial rows fill whole 16-row tiles."""
+    if world < 2 or num_heads % world or vdim % 128:
+        return False
+    per = num_heads // world
+    rows = num_tokens * per
+    lanes = send_layout_lanes(num_tokens, num_heads, world)
+    return (
+        per & (per - 1) == 0
+        and rows & (rows - 1) == 0
+        and lanes & (lanes - 1) == 0
+        and 2 * rows <= vdim
+        and lanes <= vdim
+        # The word build's strided roll shifts sublane d by d*L < a vreg.
+        and (world - 1) * per < 128
+        and num_tokens % batch_size == 0
+        and (batch_size * per) % SEND_PAD_ROWS == 0
+    )
+
+
+def send_layout_shape(
+    num_tokens: int, num_heads: int, world: int, vdim: int
+) -> tuple[int, int, int]:
+    """Shape of one rank's int16 send buffer."""
+    return (world, SEND_PAD_ROWS + num_tokens * (num_heads // world), vdim)
 
 
 def _attention_kernel(
@@ -1438,7 +1589,27 @@ def _attention_kernel(
     lse_fill: bool = False,
     fault: str | None = None,
     row_widths: tuple[int, ...] = (),
+    send_world: int = 0,
+    out_row_offset: int = 0,
+    out_in: bool = False,
+    send_exchange: tuple | None = None,
+    recv_in: bool = False,
 ):
+    # Fused exchange (`send_exchange` = (axis, lane_axis or None), with the
+    # send layout on a one-step grid; TPU_MLA_FUSED_SMALL_A2A, see
+    # SEND_SLAB_ROW0): the bo tile is per-destination slabs [W, SEND_SLAB_ROW0
+    # + bsz * L, o_dim] (partials from row SEND_SLAB_ROW0, the lse word row
+    # just ahead), the second output is the receive buffer [W * block, o_dim]
+    # and `start_end_seq_idx_ref` carries (rank, lane) at [2], [3]. With
+    # `recv_in` an extra input (the lse input's slot) is aliased with it.
+    #
+    # Merge pieces (`out_row_offset` / `out_in`; TPU_DCP_MLA_MERGE_PIECES):
+    # the output and lse are one merge piece's rows, not every token's -- row
+    # r of them is query row `out_row_offset + r`. Without `out_in` neither
+    # aliases q (the piece's first call); with it, an extra aliased input after
+    # the lse input carries the piece's earlier rows forward. Only the stores
+    # move; every value is computed exactly as before.
+    #
     # Row widths (`row_widths`, TPU_MLA_DECODE_ROW_WIDTHS; not live-group):
     # ascending static row counts (multiples of 128 below bkv_sz). A grid step
     # whose tokens all have kv_len <= w fetches only the first w rows of each
@@ -1490,6 +1661,22 @@ def _attention_kernel(
     # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
     # are recomputed over all their windows by an online-softmax fix-up with
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
+    # Body lever "pair" (see below): its unpacked-KV ring is the last scratch
+    # ref, after every other one.
+    xchg_merge = bool(
+        send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
+    )
+    recv_v_ref = None
+    if xchg_merge:
+        # [W, SEND_SLAB_ROW0 + T * L, o_dim] int16: the last scratch ref.
+        recv_v_ref = refs[-1]
+        refs = refs[:-1]
+    kv_stage_ref = None
+    if "pair" in body_levers or "quad" in body_levers:
+        assert "xqk" not in body_levers
+        # [2, 2, bkv_sz, head_dim] unpacked KV ring ("quad": [1, bsz, ...])
+        kv_stage_ref = refs[-1]
+        refs = refs[:-1]
     q_pe_hbm_ref = None
     bq_pe_x2_ref = None
     tab_hbm_ref = None
@@ -1503,12 +1690,41 @@ def _attention_kernel(
             bq_tab_x2_ref = refs[-1]  # f32[2, bsz, 2, 128]
             refs = refs[1:-1]
     assert not q_rope or split_q
+    # Send layout (`send_world` = W > 0, with `lse_fill`; TPU_DCP_MLA_SEND_LAYOUT,
+    # see SEND_PAD_ROWS): the second output is the DCP merge's int16 send
+    # buffer [W, SEND_PAD_ROWS + tokens * L, o_dim] instead of the lse, and q's
+    # aliased output is not written. Each token's [heads, o_dim] output goes,
+    # as int16 words, into the bo tile [W, bsz * L, o_dim] at rows
+    # `batch_idx * L` of every destination slab, and the tile is DMA'd to
+    # rows `SEND_PAD_ROWS + batch_start * L` (a whole number of 16-row tiles).
+    # Each token's lse is stored as a block-reversed row (head d*L+l at lane
+    # (W-1-d)*L + l) into `fill_ref` [tokens // bsz, bsz, N] (sentinel first,
+    # no lse DMA). The last grid step turns those rows into every
+    # destination's lse word row -- one stride-L lane roll per token puts
+    # head d*L+l of token t at lane t*L + l of sublane d -- and DMAs the first
+    # SEND_PAD_ROWS rows of every block from `send_wbuf`.
+    send = send_world > 0
+    xchg = send_exchange is not None
+    assert not xchg or send
+    assert not recv_in or xchg
     fill_ref = None
     fill_sem = None
+    send_wbuf = None
+    xchg_sems = None
     if lse_fill:
         assert return_lse and lse_lane_dense
-        fill_ref, fill_sem = refs[-2], refs[-1]
-        refs = refs[:-2]
+        if send and xchg:
+            # Fused exchange: the slabs are the bo tile; DMA sems (send,
+            # recv, local) take the word buffer's slot.
+            fill_ref, xchg_sems, fill_sem = refs[-3], refs[-2], refs[-1]
+            refs = refs[:-3]
+        elif send:
+            fill_ref, send_wbuf, fill_sem = refs[-3], refs[-2], refs[-1]
+            refs = refs[:-3]
+        else:
+            fill_ref, fill_sem = refs[-2], refs[-1]
+            refs = refs[:-2]
+    assert not send or (lse_fill and split_q and not preserve_suffix)
     # Live-group mode (`group_tab_ref` given; capped only): window 0 of the
     # gathered buffers is in live-group order (`prepare_capped_window_live`)
     # and arrives also as atom-block views (the two inputs after q_pe). Grid
@@ -1541,16 +1757,43 @@ def _attention_kernel(
     #            just those), instead of all head_dim columns.
     #   "noinf"  drop the artificial prev_out -> q dependency.
     #   "pbf16"  feed P to the PV matmul as q's dtype (not bit-exact).
-    assert not body_levers or group_tab_ref is not None
-    assert set(body_levers) <= set(MIXED_BODY_LEVERS), body_levers
+    #   "fxskip" run the capped overflow fix-up only on a grid step where some
+    #            token's kv_len exceeds bkv_sz (one scalar max over the step's
+    #            kv_lens); the fix-up is a no-op for every other step.
+    #   "q128"   (with in-kernel q rope) DMA only lanes 128:256 of the raw q
+    #            head -- the only lanes `load_bq` reads -- into a 128-lane
+    #            q_pe buffer.
+    #   "pair"   two tokens per softmax: their QK scores stacked into one
+    #            [2 * heads, w] tile (row max / exp / sum per row, exactly as
+    #            per token), each token's unpacked KV tile staged in a VMEM
+    #            ring (`kv_stage`, the last scratch ref) and read back by the
+    #            pair's PV, which runs after the next pair's softmax.
+    #   "xqk"    transposed scores: s^T = kv . q^T [w, heads], softmax over
+    #            sublanes, PV with a transposed-LHS contraction; the lse
+    #            arrives lane-dense (not bit-exact: reduction order).
+    # Every stage-A lever except "xqk" is bitwise-identical.
+    assert not body_levers or group_tab_ref is not None or row_widths
+    assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {
+        "nofill",
+        "quad",
+        "lrows",
+        "step8",
+    }, body_levers
+    assert not ("quad" in body_levers and "pair" in body_levers)
+    q128 = "q128" in body_levers
+    assert not q128 or q_rope
     fix_refs = None
     if capped_windows is not None:
         assert sparsecore_layout
         fix_refs = refs[-6:]
         refs = refs[:-6]
-    if lse_fill:
+    if lse_fill and not recv_in:
         # No aliased lse input: the kernel defines every row itself.
         refs = (cast(Any, None), *refs)
+    if out_in:
+        # The piece's carried output (aliased with o_hbm_ref; never read).
+        assert return_lse and not lse_fill
+        refs = (refs[0], *refs[2:])
     if return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
@@ -1575,9 +1818,14 @@ def _attention_kernel(
         lse_hbm_ref = None
         blse_x2_ref = None
 
-    assert q_hbm_ref.shape == o_hbm_ref.shape
+    assert o_hbm_ref is not None
+    assert q_hbm_ref.shape[1:] == o_hbm_ref.shape[1:]
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    # "nofill" (decode levers): the one grid step stores every row's lse.
+    nofill = (
+        "nofill" in body_levers and lse_fill and not send and num_tokens <= batch_size
+    )
     # Width of the stored output (q_nope's in split-q mode, else head_dim).
     o_dim = head_dim
     if split_q:
@@ -1599,6 +1847,35 @@ def _attention_kernel(
 
     assert head_dim % 128 == 0
     assert num_q_heads % q_packing == 0
+    if send:
+        assert send_layout_supported(
+            num_tokens, num_q_heads, send_world, o_dim, batch_size
+        ), (num_tokens, num_q_heads, send_world, o_dim, batch_size)
+        send_per = num_q_heads // send_world
+        send_rows = num_tokens * send_per
+        send_lanes = send_layout_lanes(num_tokens, num_q_heads, send_world)
+    # First partial row of a destination's slab in the bo tile.
+    slab_row0 = SEND_SLAB_ROW0 if xchg else 0
+    if xchg:
+        assert not preserve_suffix and batch_size == num_tokens, (
+            "the fused exchange runs on a one-step grid"
+        )
+        assert send, "the fused exchange needs the send layout"
+        assert bo_x2_ref is not None and lse_hbm_ref is not None
+        xchg_axis, xchg_lane_axis = send_exchange[:2]
+        # Rows each destination receives from row SEND_SLAB_ROW0 of its block.
+        xchg_rows = SEND_SLAB_ROW0 + send_rows  # pyrefly: ignore[unbound-name]
+        xchg_block = SEND_PAD_ROWS + send_rows
+        assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
+        if xchg_merge:
+            assert recv_v_ref is not None
+            assert recv_v_ref.shape == (send_world, xchg_rows, o_dim), recv_v_ref.shape
+            assert lse_hbm_ref.shape == (send_rows, o_dim), lse_hbm_ref.shape
+            assert lse_hbm_ref.dtype == jnp.int16 and send_rows % 16 == 0
+        else:
+            assert lse_hbm_ref.shape == (send_world * xchg_block, o_dim), (
+                lse_hbm_ref.shape
+            )
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -1689,6 +1966,44 @@ def _attention_kernel(
         else:
             cp.start()
 
+    def _fetch_live_rows(seq_idx_start, bkv_sem_idx, rows, *, wait=False):
+        sem_nope = sems.at[0, bkv_sem_idx]
+        sem_rope = sems.at[3, bkv_sem_idx]
+        bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :]
+        bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :]
+        # "lrows": token b moves rows [0, n_b), n_b = its kv_len rounded
+        # up to 32 (>= 32, <= rows); one DMA per (token, cache) on the
+        # cache's semaphore, waited with the same descriptors.
+        page_idx_start = seq_idx_start - start_seq_idx
+        rope_div = bkv_sz // cache_kv_rope_hbm_ref.shape[1]
+        for b in range(batch_size):
+            kv_b = kv_lens_ref[seq_idx_start + b]
+            n_b = jnp.clip((kv_b + 31) // 32 * 32, 32, rows)
+            n_b = pl.multiple_of(n_b, 32)
+            r_b = pl.multiple_of(n_b // rope_div, 8)
+            nope_dst = bkv_nope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, n_b)]
+            rope_dst = bkv_rope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, r_b)]
+            if wait:
+                _async_copy(nope_dst, nope_dst, sem_nope, True)
+                _async_copy(rope_dst, rope_dst, sem_rope, True)
+            else:
+                _async_copy(
+                    cache_kv_nope_hbm_ref.at[
+                        pl.ds(page_idx_start + b, 1), pl.ds(0, n_b)
+                    ],
+                    nope_dst,
+                    sem_nope,
+                    False,
+                )
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[
+                        pl.ds(page_idx_start + b, 1), pl.ds(0, r_b)
+                    ],
+                    rope_dst,
+                    sem_rope,
+                    False,
+                )
+
     if is_dcp_mode:
 
         def _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, slice_sz, *, wait=False):
@@ -1753,6 +2068,15 @@ def _attention_kernel(
                     wait,
                 )
                 return
+            if (
+                row_widths
+                and sparsecore_layout
+                and rows is not None
+                and "lrows" in body_levers
+            ):
+                # The token-row layout `_fetch_live_rows` addresses.
+                _fetch_live_rows(seq_idx_start, bkv_sem_idx, rows, wait=wait)
+                return
             if row_widths:
                 # `row_widths` picks the width (`with_row_width`), not the rungs.
                 _fetch_bkv_slice(
@@ -1784,6 +2108,9 @@ def _attention_kernel(
             # The index into cache_kv_hbm_ref should be relative to the current
             # chunk.
             page_idx_start = seq_idx_start - start_seq_idx
+            if rows is not None and "lrows" in body_levers:
+                _fetch_live_rows(seq_idx_start, bkv_sem_idx, rows, wait=wait)
+                return
             if rows is not None:
                 # `row_widths`: only the first `rows` rows of each token's tile.
                 rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
@@ -1892,7 +2219,20 @@ def _attention_kernel(
                 sem,
                 wait,
             )
-            if split_q:
+            if split_q and q128:
+                # "q128": only lanes 128:256 of the raw head, the lanes
+                # `load_bq` reads, into the 128-lane q_pe buffer.
+                _async_copy(
+                    q_pe_hbm_ref.at[
+                        pl.ds(seq_idx_start, batch_size),
+                        :,
+                        pl.ds(Q_ROPE_HEAD_DIM - 128, 128),
+                    ],
+                    bq_pe_x2_ref.at[bq_sem_idx, :],
+                    sem,
+                    wait,
+                )
+            elif split_q:
                 # Same semaphore; the waits below mirror both starts.
                 _async_copy(
                     q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
@@ -1919,6 +2259,8 @@ def _attention_kernel(
                 )
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
+        if xchg:
+            return  # The slabs leave by the exchange's remote pushes.
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx, :]
 
@@ -1935,12 +2277,15 @@ def _attention_kernel(
             return
 
         if not wait:
-            _async_copy(
-                vmem_ref,
-                o_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
-                sem,
-                wait,
-            )
+            if send:
+                # This step's partial rows of every destination block.
+                row = pl.multiple_of(
+                    SEND_PAD_ROWS + seq_idx_start * send_per, SEND_PAD_ROWS
+                )
+                dst = lse_hbm_ref.at[:, pl.ds(row, batch_size * send_per), :]
+            else:
+                dst = o_hbm_ref.at[pl.ds(seq_idx_start - out_row_offset, batch_size)]
+            _async_copy(vmem_ref, dst, sem, wait)
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
@@ -1948,10 +2293,16 @@ def _attention_kernel(
         sem = sems.at[4, bo_sem_idx]
         vmem_ref = blse_x2_ref.at[bo_sem_idx, :]
 
+        if send:
+            # No lse output: keep the step's rows for the word build.
+            if not wait:
+                assert fill_ref is not None
+                fill_ref[lax.div(seq_idx_start, batch_size)] = vmem_ref[...]
+            return
         if not wait:
             _async_copy(
                 vmem_ref,
-                lse_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                lse_hbm_ref.at[pl.ds(seq_idx_start - out_row_offset, batch_size)],
                 sem,
                 wait,
             )
@@ -2011,7 +2362,10 @@ def _attention_kernel(
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
-            raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
+            if q128:
+                raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
+            else:
+                raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
             tab = bq_tab_x2_ref.at[bq_sem_idx, batch_idx][...]
             q = jnp.concatenate([q, rope_q_block(raw, tab, fault)], -1)
         elif split_q:
@@ -2021,6 +2375,271 @@ def _attention_kernel(
                 q = jnp.pad(q, ((0, 0), (0, head_dim - q.shape[-1])))
         return q
 
+    def store_out(bo_sem_idx, batch_idx, out):
+        """Stores one token's [num_q_heads, >= o_dim] output into the bo tile."""
+        if not send:
+            bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
+            return
+        # Send layout: head slab w (L rows) to rows batch_idx*L of
+        # destination w's slab, as int16 words (a bitcast: bits unchanged).
+        words = pltpu.bitcast(out[:, :o_dim], jnp.int16)
+        if not isinstance(batch_idx, int):
+            for b in range(batch_size):
+                pl.when(batch_idx == b)(
+                    functools.partial(store_out, bo_sem_idx, b, out)
+                )
+            return
+        rows = pl.ds(slab_row0 + batch_idx * send_per, send_per)
+        assert bo_x2_ref is not None
+        for w in range(send_world):
+            dest = (w + 1) % send_world if fault == "send_dest_rotate" else w
+            bo_x2_ref[bo_sem_idx, dest, rows, :] = words[
+                w * send_per : (w + 1) * send_per
+            ]
+
+    def build_send_lse_words():
+        """Every destination's lse word row from `fill_ref`, as the int16
+        [W, SEND_PAD_ROWS, o_dim] head of its block (row SEND_PAD_ROWS - 1)."""
+        lanes = send_lanes
+        x = jnp.concatenate(
+            [fill_ref[i] for i in range(num_tokens // batch_size)], axis=0
+        )  # f32 [tokens, lanes], block-reversed heads
+        bits = lax.bitcast_convert_type(x, jnp.int32)
+        hi = lax.shift_right_arithmetic(bits, jnp.int32(16))
+        # The low half as a signed 16-bit value (the packed merge's words).
+        lo = ((bits & 0xFFFF) ^ 0x8000) - 0x8000
+        lane = lax.broadcasted_iota(jnp.int32, x.shape, 1)
+        lo_src = pltpu.roll(lo, send_rows % lanes, 1) if send_rows % lanes else lo
+        if fault == "send_lse_lo_skip":
+            lo_src = jnp.zeros_like(lo_src)
+        src = jnp.where(
+            lane < num_q_heads,
+            hi,
+            jnp.where(
+                (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
+            ),
+        )
+        # Sublane d of the result is rolled by d*L once at the end (one
+        # strided roll, shifts below a vreg width); before it, lane j of
+        # sublane d holds what lands at J = (j + d*L) mod lanes. Token t's
+        # source row, rolled by t*L - (W-1)*L, puts head d*L+l (lane
+        # (W-1-d)*L + l) at J = t*L + l and its lo half at rows + t*L + l, so
+        # each lane takes the token whose words cover its J.
+        shape = (send_world, lanes)
+        big_j = (
+            lax.broadcasted_iota(jnp.int32, shape, 1)
+            + lax.broadcasted_iota(jnp.int32, shape, 0) * send_per
+        ) & (lanes - 1)
+        tok = lax.shift_right_logical(
+            big_j & (send_rows - 1), jnp.int32(send_per.bit_length() - 1)
+        )
+        tok = jnp.where(big_j < 2 * send_rows, tok, -1)
+        acc = jnp.zeros(shape, jnp.int32)
+        for t in range(num_tokens):
+            shift = (t * send_per - (send_world - 1) * send_per) % lanes
+            row = src[t : t + 1, :]
+            if shift:
+                row = pltpu.roll(row, shift, 1)
+            acc = jnp.where(tok == t, jnp.broadcast_to(row, shape), acc)
+        acc = pltpu.roll(acc, 0, 1, stride=send_per, stride_axis=0)
+        if lanes < o_dim:
+            acc = jnp.concatenate(
+                [acc, jnp.zeros((send_world, o_dim - lanes), jnp.int32)], axis=1
+            )
+        # int16 row 2r+1 is the high half of int32 row r: the word row goes
+        # to int16 row SEND_PAD_ROWS - 1, every other head row is zero.
+        tile_shape = (send_world, SEND_PAD_ROWS // 2, o_dim)
+        r = lax.broadcasted_iota(jnp.int32, tile_shape, 1)
+        word = jnp.broadcast_to(
+            lax.shift_left(acc, jnp.int32(16))[:, None, :], tile_shape
+        )
+        if xchg:
+            assert bo_x2_ref is not None
+            # Fused exchange: the word row is int16 row SEND_SLAB_ROW0 - 1 of
+            # each slab, rows before it zero; the slab's first tile also holds
+            # partial rows from SEND_SLAB_ROW0 on, so it is read back (int32
+            # row r = int16 rows 2r, 2r + 1) and only rows < SEND_SLAB_ROW0
+            # are replaced.
+            head = bo_x2_ref[0, :, pl.ds(0, SEND_PAD_ROWS), :]
+            old = pltpu.bitcast(head, jnp.int32)
+            tile = jnp.where(
+                r == SEND_SLAB_ROW0 // 2 - 1,
+                word,
+                jnp.where(r < SEND_SLAB_ROW0 // 2, 0, old),
+            )
+            bo_x2_ref[0, :, pl.ds(0, SEND_PAD_ROWS), :] = pltpu.bitcast(tile, jnp.int16)
+            return
+        tile = jnp.where(r == SEND_PAD_ROWS // 2 - 1, word, 0)
+        assert send_wbuf is not None
+        send_wbuf[...] = pltpu.bitcast(tile, jnp.int16)
+
+    def send_words_copy():
+        return pltpu.make_async_copy(
+            send_wbuf, lse_hbm_ref.at[:, pl.ds(0, SEND_PAD_ROWS), :], fill_sem
+        )
+
+    def xchg_peer(j):
+        # Inside a (lane, axis) mesh a peer is (my lane, j); both as data.
+        ids = {xchg_axis: jnp.int32(j)}
+        if xchg_lane_axis is not None:
+            ids[xchg_lane_axis] = start_end_seq_idx_ref[3]
+        return ids
+
+    def xchg_signal():
+        """Barrier: every rank signals every rank once, itself included, at
+        kernel entry; the wait sits after the body (`xchg_round`)."""
+        bsem = pltpu.get_barrier_semaphore()
+        for j in range(send_world):
+            pl.semaphore_signal(
+                bsem, 1, device_id=xchg_peer(j), device_id_type=pl.DeviceIdType.MESH
+            )
+
+    def xchg_round():
+        """small_all_to_all's round on the slabs: slab d into rows
+        [me * block + SEND_SLAB_ROW0, (me + 1) * block) of rank d's output,
+        the own slab by a local copy, then wait for the n - 1 arrivals (bytes
+        counted on local descriptors) and for the own sends. One barrier per
+        call suffices as in small_all_to_all: a rank leaves call k only after
+        every peer's block of call k landed and its own sends are done."""
+        n = send_world
+        me = start_end_seq_idx_ref[2]
+        send_sem, recv_sem, local_sem = (xchg_sems.at[i] for i in range(3))
+        if fault != "send_xchg_entry_wait":
+            pl.semaphore_wait(pltpu.get_barrier_semaphore(), n)
+        drop = fault == "send_peer_drop"
+        expect = n - 2 if drop else n - 1
+        slot = lax.rem(me + 1, n) if fault == "send_peer_misorder" else me
+
+        def rows_of(k):
+            if xchg_merge:
+                # Merge mode: slot k of the receive scratch (VMEM).
+                return recv_v_ref.at[k]
+            start = k * xchg_block + SEND_SLAB_ROW0
+            if not isinstance(k, int):
+                start = pl.multiple_of(start, 8)
+            return lse_hbm_ref.at[pl.ds(start, xchg_rows)]
+
+        mine = rows_of(slot)
+        for j in range(n):
+            skip = jnp.int32(j) == me
+            if drop:
+                skip = skip | (jnp.int32(j) == lax.rem(me + 3, n))
+
+            @pl.when(jnp.logical_not(skip))
+            def _(j=j):
+                if fault == "send_xchg_rm_round":
+                    # Timing only: the round without the peers -- slab j
+                    # copied into this rank's own slot j.
+                    pltpu.make_async_copy(
+                        bo_x2_ref.at[0, j], rows_of(j), recv_sem
+                    ).start()
+                    return
+                pltpu.make_async_remote_copy(
+                    src_ref=bo_x2_ref.at[0, j],
+                    dst_ref=mine,
+                    send_sem=send_sem,
+                    recv_sem=recv_sem,
+                    device_id=xchg_peer(j),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+        local = pltpu.make_async_copy(bo_x2_ref.at[0, me], rows_of(me), local_sem)
+        local.start()
+        others = (
+            recv_v_ref.at[pl.ds(0, expect)]
+            if xchg_merge
+            else lse_hbm_ref.at[pl.ds(0, expect * xchg_rows)]
+        )
+        pltpu.make_async_copy(others, others, recv_sem).wait()
+        local.wait()
+        if fault != "send_xchg_rm_round":
+            pltpu.make_async_copy(others, others, send_sem).wait()
+
+    def xchg_merge_store():
+        """Merge mode: the unpack + torch `_merge_received` on the W received
+        slabs in `recv_v_ref`, term by term, senders in order 0..W-1; the bf16
+        result's words go to bo slot 1 and one DMA to the second output.
+
+        Two passes so that few values are live at once: the lse columns and
+        weights first (one [tl, 1] column per sender), then each sender's
+        partial rows streamed into two f32 accumulators."""
+        n = send_world
+        tl = send_rows
+        assert bo_x2_ref is not None and recv_v_ref is not None
+        assert lse_hbm_ref is not None
+        # Trace-time: the lse word row carries row r's hi/lo halves in lanes r
+        # and tl + r of one o_dim-wide row, and the lane->sublane select reads
+        # the first 128 lanes -- both need these static bounds.
+        assert tl <= 128, ("in-kernel merge needs send_rows <= 128", tl)
+        assert 2 * tl <= o_dim, (
+            "in-kernel merge needs 2*send_rows <= o_dim",
+            tl,
+            o_dim,
+        )
+        hdr = SEND_PAD_ROWS  # the first int16 tile of a slab (word row inside)
+        live = start_end_seq_idx_ref[4] * send_per  # real tokens x L
+        r128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 0)
+        c128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 1)
+        l_cols = []
+        for w in range(n):
+            # int16 words to int32 lanes (sign-extended): row SEND_SLAB_ROW0 - 1
+            # of the slab is the lse word row.
+            head = recv_v_ref[w, pl.ds(0, hdr), :].astype(jnp.int32)
+            words = head[SEND_SLAB_ROW0 - 1 : SEND_SLAB_ROW0]  # [1, o_dim]
+            lo_src = pltpu.roll(words, o_dim - tl, 1)  # lane r <- lane tl + r
+            bits = lax.shift_left(words, jnp.int32(16)) | (lo_src & 0xFFFF)
+            l_row = lax.bitcast_convert_type(bits, jnp.float32)[:, :128]
+            # Lanes to sublanes exactly: row r keeps only lane r (a masked max).
+            l_cols.append(
+                jnp.max(
+                    jnp.where(
+                        r128 == c128, jnp.broadcast_to(l_row, (tl, 128)), -jnp.inf
+                    ),
+                    axis=1,
+                    keepdims=True,
+                )
+            )  # f32 [tl, 1]
+        finite = [jnp.isfinite(c) for c in l_cols]
+        shift = jnp.where(finite[0], l_cols[0], -jnp.inf)
+        for w in range(1, n):
+            shift = jnp.maximum(shift, jnp.where(finite[w], l_cols[w], -jnp.inf))
+        shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+        weights = [
+            jnp.where(finite[w], jnp.exp(l_cols[w] - shift), 0.0) for w in range(n)
+        ]
+        denom = weights[0]
+        for w in range(1, n):
+            denom = denom + weights[w]
+        denom = jnp.where(denom > 0, denom, 1.0)
+        rows_i = lax.broadcasted_iota(jnp.int32, (tl, o_dim), 0)
+        acc_hi = jnp.zeros((tl, o_dim), jnp.float32)
+        acc_lo = jnp.zeros((tl, o_dim), jnp.float32)
+        for w in range(n):
+            wt = weights[w] / denom
+            w_hi = wt.astype(jnp.bfloat16).astype(jnp.float32)
+            w_lo = wt - w_hi
+            if fault == "send_merge_lo_skip":
+                w_lo = jnp.zeros_like(w_lo)
+            # bf16 -> f32 is the bits shifted up 16 (exact, NaNs kept); the
+            # unpack zeroes partial rows past the real ones; NaN partials are
+            # zeroed as the merge does.
+            xi = recv_v_ref[w].astype(jnp.int32)  # [SEND_SLAB_ROW0 + tl, o_dim]
+            part = lax.bitcast_convert_type(
+                lax.shift_left(xi[SEND_SLAB_ROW0 : SEND_SLAB_ROW0 + tl], jnp.int32(16)),
+                jnp.float32,
+            )
+            part = jnp.where(rows_i < live, part, 0.0)
+            part = jnp.where(jnp.isnan(part), 0.0, part)
+            acc_hi = acc_hi + part * w_hi
+            acc_lo = acc_lo + part * w_lo
+        out = (acc_hi + acc_lo).astype(jnp.bfloat16)
+        bo_x2_ref[1, 0, pl.ds(0, tl), :] = pltpu.bitcast(out, jnp.int16)
+        copy = pltpu.make_async_copy(
+            bo_x2_ref.at[1, 0, pl.ds(0, tl)], lse_hbm_ref, fill_sem
+        )
+        copy.start()
+        copy.wait()
+
     def store_blse(bo_sem_idx, batch_idx, lse_col):
         """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
         if not lse_lane_dense:
@@ -2028,10 +2647,19 @@ def _attention_kernel(
             return
         # Heads from sublanes to lanes, exactly: each column of the masked
         # [heads, heads] tile holds one live entry, the rest -inf.
-        eye_shape = (num_q_heads, num_q_heads)
-        eye = lax.broadcasted_iota(jnp.int32, eye_shape, 0) == (
-            lax.broadcasted_iota(jnp.int32, eye_shape, 1)
-        )
+        if send:
+            # Send layout: head d*L+l to lane (W-1-d)*L + l of a send_lanes
+            # row (the word build's stride-L roll then needs no negative
+            # stride); lanes past the heads stay -inf.
+            eye_shape = (num_q_heads, send_lanes)
+            h = lax.broadcasted_iota(jnp.int32, eye_shape, 0)
+            target = (send_world - 1) * send_per - h + 2 * (h & (send_per - 1))
+            eye = lax.broadcasted_iota(jnp.int32, eye_shape, 1) == target
+        else:
+            eye_shape = (num_q_heads, num_q_heads)
+            eye = lax.broadcasted_iota(jnp.int32, eye_shape, 0) == (
+                lax.broadcasted_iota(jnp.int32, eye_shape, 1)
+            )
         row = jnp.max(
             jnp.where(eye, jnp.broadcast_to(lse_col, eye_shape), -jnp.inf),
             axis=0,
@@ -2095,7 +2723,9 @@ def _attention_kernel(
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
-    def load_bkv(bkv_sem_idx, batch_idx, slice_sz=bkv_sz, levers=()):
+    def load_bkv(bkv_sem_idx, batch_idx, rows=None, levers=()):
+        # `rows` None = the whole bkv_sz tile (kv rungs / row widths narrow it).
+        slice_sz = bkv_sz if rows is None else rows
         if levers:
             return load_bkv_levers(bkv_sem_idx, batch_idx, slice_sz, levers)
         nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
@@ -2256,7 +2886,7 @@ def _attention_kernel(
                     if q_dtype == jnp.float32
                     else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
                 )
-                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
+                store_out(bo_sem_idx, batch_idx, out)
                 if return_lse:
                     store_blse(bo_sem_idx, batch_idx, fix_m_ref[...] + jnp.log(l_sum))
 
@@ -2317,7 +2947,177 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        def run_steps(slice_sz=bkv_sz, levers=()):
+        def pair_finish(k, par, p, l_sum, m, levers):
+            """PV, normalise and stores of token pair k (staged in slot par)."""
+            h = num_q_heads
+            for j in range(2):
+                kv = kv_stage_ref.at[par, j, pl.ds(0, p.shape[1])][...]
+                p_j = p[j * h : (j + 1) * h]
+                l_j = l_sum[j * h : (j + 1) * h]
+                m_j = m[j * h : (j + 1) * h]
+                out = attention_step2_pv(p_j, kv, l_j, levers)
+                store_out(bo_sem_idx, 2 * k + j, out)
+                write_blse(2 * k + j, m_j, l_j)
+
+        def run_pairs(rows, levers):
+            """Body lever "pair": QK of tokens 2k, 2k+1 stacked into one
+            [2 * heads, w] score tile with one row max / exp / sum, their
+            unpacked KV staged in `kv_stage_ref[k % 2]`; pair k's PV runs
+            after pair k + 1's softmax and reads its KV back from VMEM."""
+            assert batch_size % 2 == 0
+            h = num_q_heads
+            prev = None
+            for k in range(batch_size // 2):
+                par = k % 2
+                t0, t1 = 2 * k, 2 * k + 1
+                kv_len0 = kv_lens_ref[batch_start_seq_idx + t0]
+                kv_len1 = kv_lens_ref[batch_start_seq_idx + t1]
+                kv0 = load_bkv(bi_sem_idx, t0, rows, levers)
+                kv1 = load_bkv(bi_sem_idx, t1, rows, levers)
+                w = kv0.shape[0]
+                kv_stage_ref.at[par, 0, pl.ds(0, w)][...] = kv0
+                kv_stage_ref.at[par, 1, pl.ds(0, w)][...] = kv1
+                q0 = load_bq(bi_sem_idx, t0)
+                q1 = load_bq(bi_sem_idx, t1)
+                s = jnp.concatenate(
+                    [
+                        jnp.einsum(
+                            "nd,md->nm", q0, kv0, preferred_element_type=jnp.float32
+                        ),
+                        jnp.einsum(
+                            "nd,md->nm", q1, kv1, preferred_element_type=jnp.float32
+                        ),
+                    ],
+                    axis=0,
+                )
+                s *= sm_scale
+                if k_scale != 1.0:
+                    s *= k_scale
+                pair_row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+                pair_lim = jnp.where(pair_row < h, kv_len0, kv_len1)
+                pair_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+                s = jnp.where(pair_span < pair_lim, s, jnp.finfo(jnp.float32).min)
+                m = jnp.max(s, axis=1, keepdims=True)
+                p = jnp.exp(s - m)
+                l_sum = jnp.sum(p, axis=1, keepdims=True)
+                if prev is not None:
+                    pair_finish(k - 1, *prev, levers)
+                prev = (par, p, l_sum, m)
+            assert prev is not None
+            pair_finish(batch_size // 2 - 1, *prev, levers)
+
+        def run_quad(rows, levers):
+            """Decode lever "quad": the step's bsz tokens' QK scores stacked
+            into one [bsz * heads, w] tile (row max / exp / sum per row),
+            their unpacked KV staged in `kv_stage_ref[0]` and read back by
+            the PVs after the softmax."""
+            h = num_q_heads
+            scores = []
+            kv_lens = []
+            w = None
+            for t in range(batch_size):
+                kv_lens.append(kv_lens_ref[batch_start_seq_idx + t])
+                kv = load_bkv(bi_sem_idx, t, rows, levers)
+                w = kv.shape[0]
+                kv_stage_ref.at[0, t, pl.ds(0, w)][...] = kv
+                q = load_bq(bi_sem_idx, t)
+                scores.append(
+                    jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+                )
+            s = jnp.concatenate(scores, axis=0)
+            s *= sm_scale
+            if k_scale != 1.0:
+                s *= k_scale
+            row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+            lim = jnp.full(s.shape, kv_lens[batch_size - 1], jnp.int32)
+            for t in range(batch_size - 2, -1, -1):
+                lim = jnp.where(row < (t + 1) * h, kv_lens[t], lim)
+            span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(span < lim, s, jnp.finfo(jnp.float32).min)
+            m = jnp.max(s, axis=1, keepdims=True)
+            p = jnp.exp(s - m)
+            l_sum = jnp.sum(p, axis=1, keepdims=True)
+            for t in range(batch_size):
+                kv = kv_stage_ref.at[0, t, pl.ds(0, w)][...]
+                out = attention_step2_pv(
+                    p[t * h : (t + 1) * h], kv, l_sum[t * h : (t + 1) * h], levers
+                )
+                store_out(bo_sem_idx, t, out)
+                write_blse(t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h])
+
+        def xqk_row_to_col(row):
+            """[1, heads] -> [heads, 1] exactly (one live entry per row)."""
+            h = num_q_heads
+            eye = lax.broadcasted_iota(jnp.int32, (h, h), 0) == (
+                lax.broadcasted_iota(jnp.int32, (h, h), 1)
+            )
+            return jnp.max(
+                jnp.where(eye, jnp.broadcast_to(row, (h, h)), -jnp.inf),
+                axis=1,
+                keepdims=True,
+            )
+
+        def xqk_step1(q, kv, kv_len):
+            st = jnp.einsum("md,nd->mn", kv, q, preferred_element_type=jnp.float32)
+            st *= sm_scale
+            if k_scale != 1.0:
+                st *= k_scale
+            xqk_key = lax.broadcasted_iota(jnp.int32, st.shape, 0)
+            st = jnp.where(xqk_key < kv_len, st, jnp.finfo(jnp.float32).min)
+            m = jnp.max(st, axis=0, keepdims=True)  # [1, heads]
+            p = jnp.exp(st - m)
+            l_sum = jnp.sum(p, axis=0, keepdims=True)  # [1, heads]
+            return p, l_sum, m
+
+        def xqk_step2(p, kv, l_sum, levers):
+            if "pv512" in levers and split_q:
+                kv = kv[:, :o_dim]
+            pv = jnp.einsum("mn,md->nd", p, kv, preferred_element_type=jnp.float32)
+            if k_scale != 1.0:
+                pv *= k_scale
+            l_col = xqk_row_to_col(l_sum)
+            if q_dtype == jnp.float32:
+                return lax.div(pv, l_col)
+            return (pv * pl.reciprocal(l_col, approx=True)).astype(q_dtype)
+
+        def xqk_write_blse(batch_idx, m, l_sum):
+            if not return_lse:
+                return
+            lse_row = m + jnp.log(l_sum)  # [1, heads]
+            if is_dcp_mode or lse_mask_empty:
+                # As `write_blse`: a token this rank owns none of weighs 0.
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                lse_row = jnp.where(kv_len > 0, lse_row, -jnp.inf)
+            if lse_lane_dense and not send:
+                blse_x2_ref.at[bo_sem_idx][pl.ds(batch_idx, 1), :] = lse_row
+            else:
+                store_blse(bo_sem_idx, batch_idx, xqk_row_to_col(lse_row))
+
+        def run_steps_xqk(rows, levers):
+            """Body lever "xqk": per token s^T [w, heads], token t's softmax
+            overlapping token t - 1's PV, as `run_steps`."""
+            prev = None
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
+                bq = load_bq(bi_sem_idx, batch_idx)
+                p, l_sum, m = xqk_step1(bq, bkv, kv_len)
+                if prev is not None:
+                    out = xqk_step2(prev[0], prev[1], prev[2], levers)
+                    store_out(bo_sem_idx, batch_idx - 1, out)
+                    xqk_write_blse(batch_idx - 1, prev[3], prev[2])
+                prev = (p, bkv, l_sum, m)
+            out = xqk_step2(prev[0], prev[1], prev[2], levers)
+            store_out(bo_sem_idx, batch_size - 1, out)
+            xqk_write_blse(batch_size - 1, prev[3], prev[2])
+
+        def run_steps(rows=None, levers=()):
+            if "pair" in levers:
+                return run_pairs(rows, levers)
+            if "quad" in levers:
+                return run_quad(rows, levers)
+            if "xqk" in levers:
+                return run_steps_xqk(rows, levers)
             prev_p = None
             prev_bkv = None
             prev_l_sum = None
@@ -2326,7 +3126,7 @@ def _attention_kernel(
 
             for batch_idx in range(batch_size):
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-                bkv = load_bkv(bi_sem_idx, batch_idx, slice_sz=slice_sz, levers=levers)
+                bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
                 bq = load_bq(bi_sem_idx, batch_idx)
 
                 if prev_out is not None and "noinf" not in levers:
@@ -2346,7 +3146,7 @@ def _attention_kernel(
                     out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum, levers)
 
                     # Store output from acc to bo.
-                    bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
+                    store_out(bo_sem_idx, batch_idx - 1, out)
                     write_blse(batch_idx - 1, prev_m, prev_l_sum)
                     prev_out = out
 
@@ -2357,7 +3157,7 @@ def _attention_kernel(
 
             # end of pipelining loop
             out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum, levers)
-            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
+            store_out(bo_sem_idx, batch_size - 1, out)
             write_blse(batch_size - 1, prev_m, prev_l_sum)
 
         if group_tab_ref is not None:
@@ -2391,7 +3191,7 @@ def _attention_kernel(
                 zero_out = jnp.zeros((num_q_heads, o_dim), dtype=q_dtype)
                 neg_inf_lse = jnp.full((num_q_heads, 1), -jnp.inf, dtype=jnp.float32)
                 for batch_idx in range(batch_size):
-                    bo_x2_ref.at[bo_sem_idx, batch_idx][...] = zero_out
+                    store_out(bo_sem_idx, batch_idx, zero_out)
                     if return_lse:
                         store_blse(bo_sem_idx, batch_idx, neg_inf_lse)
 
@@ -2402,7 +3202,11 @@ def _attention_kernel(
                     # even when the batch is all-empty.
                     wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
                     pl.when(batch_max_kv_len > 0)(
-                        functools.partial(run_steps, bkv_sz if rows is None else rows)
+                        functools.partial(
+                            run_steps,
+                            bkv_sz if rows is None else rows,
+                            tuple(body_levers),
+                        )
                     )
 
                 with_row_width(batch_start_seq_idx, wait_and_run)
@@ -2422,11 +3226,21 @@ def _attention_kernel(
 
             with_row_width(batch_start_seq_idx, wait_and_run)
         else:
-            run_steps()
-        if capped_windows is not None:
+            run_steps(None, tuple(body_levers))
+        if capped_windows is not None and "fxskip" in body_levers:
+            # "fxskip": the fix-up only where some token overflows bkv_sz.
+            fix_base = batch_start_seq_idx
+            fix_need = kv_lens_ref[fix_base]
+            for b in range(1, batch_size):
+                fix_need = jnp.maximum(fix_need, kv_lens_ref[fix_base + b])
+            need_fix = fix_need > bkv_sz
+            pl.when(need_fix)(
+                functools.partial(fixup_capped_overflow, bi_sem_idx, bo_sem_idx)
+            )
+        elif capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
-        if lse_fill:
+        if lse_fill and not send and not nofill:
             # The sentinel fill must land before this step's rows overwrite it.
             @pl.when(pl.program_id(0) == 0)
             def _():
@@ -2450,6 +3264,17 @@ def _attention_kernel(
                 sentinel = 0.0  # positive control: a wrong sentinel
             assert fill_ref is not None
             fill_ref[...] = jnp.full(fill_ref.shape, sentinel, jnp.float32)
+            if send:
+                return  # VMEM only: the word build reads it.
+            if nofill:
+                # The only step stores every row; the fill is needed only
+                # when there is no work (no step stores anything).
+                @pl.when(jnp.logical_not(has_work))
+                def _():
+                    fill_copy().start()
+                    fill_copy().wait()
+
+                return
             fill_copy().start()
 
             @pl.when(jnp.logical_not(has_work))
@@ -2464,10 +3289,36 @@ def _attention_kernel(
             functools.partial(start_fetch_bkv_batch, batch_start_seq_idx, 0),
         )
 
+    if xchg:
+        if xchg_merge and fault in ("send_peer_misorder", "send_peer_drop"):
+            # Test only: a slot nobody writes reads NaN (before any peer can
+            # push: they wait for this rank's barrier signal).
+            assert recv_v_ref is not None
+            recv_v_ref[...] = jnp.full(recv_v_ref.shape, 0x7FC0, jnp.int16)
+        # One grid step: the collective section is unconditional (every rank
+        # signals, pushes and counts every block, with or without work).
+        xchg_signal()
+        if fault == "send_xchg_entry_wait":
+            pl.semaphore_wait(pltpu.get_barrier_semaphore(), send_world)
+
     if lse_fill:
         pl.when(has_work)(process)
     else:
         process()
+
+    is_last = pl.program_id(0) == pl.num_programs(0) - 1
+    if xchg:
+        build_send_lse_words()
+        xchg_round()
+        if xchg_merge:
+            xchg_merge_store()
+    elif send:
+        # Every token's lse is in `fill_ref` now; the words overlap the last
+        # partial DMA.
+        @pl.when(is_last)
+        def _send_words():
+            build_send_lse_words()
+            send_words_copy().start()
 
     @pl.when(jnp.logical_and(batch_end_seq_idx == end_seq_idx - 1, has_work))
     def epilogue():
@@ -2486,7 +3337,22 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(0, 1, wait=True)
 
+    if send and not xchg:
+        pl.when(is_last)(lambda: send_words_copy().wait())
+
     ### ------- Kernel end ------- ###
+
+
+def merge_pieces_supported(num_tokens: int, chunk_size: int, pieces: int) -> bool:
+    """Whether `out_pieces=pieces` applies to a `num_tokens` bucket attended in
+    `chunk_size` chunks: several whole chunks, and pieces that are whole chunks
+    or split one evenly (a piece is then that chunk's output)."""
+    if pieces <= 1 or num_tokens <= chunk_size or num_tokens % chunk_size:
+        return False
+    if num_tokens % pieces:
+        return False
+    rows = num_tokens // pieces
+    return rows % chunk_size == 0 or chunk_size % rows == 0
 
 
 def _chunk_kernel_batch_size(
@@ -2566,6 +3432,12 @@ def prepare_outputs(
         "kv_write_fault",
         "mixed_fused_prep",
         "decode_row_widths",
+        "decode_body_levers",
+        "send_world",
+        "send_exchange",
+        "out_pieces",
+        "out_pieces_fault",
+        "out_pieces_gather_first",
         "packed_rope",
     ),
 )
@@ -2615,6 +3487,14 @@ def sparse_ragged_paged_attention(
     kv_write_fault: str | None = None,
     mixed_fused_prep: bool = False,
     decode_row_widths: tuple[int, ...] = (),
+    send_world: int = 0,
+    out_pieces: int = 0,
+    decode_body_levers: tuple[str, ...] = (),
+    out_pieces_fault: str | None = None,
+    out_pieces_gather_first: bool = False,
+    send_exchange: tuple | None = None,
+    send_peer: jax.Array | None = None,
+    send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
@@ -2681,6 +3561,9 @@ def sparse_ragged_paged_attention(
       capped_live_rows: With `topk_cap`, the native gather also skips each
         (window, token) row's 64-slot atoms past its live count; the kernel
         never reads those slots (`kv_len` masks), so outputs are unchanged.
+        Plain capped window-prep path only: `fused_window_prep` (decode) and
+        `mixed_live_gather` (live-group) calls already bound their gathers and
+        ignore it.
       q_pe: Split-q mode. `q` is then q_nope only, `[max_num_tokens,
         num_q_heads, nope]` with `nope` a multiple of 128 and `num_q_heads` a
         multiple of the dtype packing, and `q_pe` `[max_num_tokens,
@@ -2722,7 +3605,8 @@ def sparse_ragged_paged_attention(
       lse_in_kernel: With `return_lse`, `lse_lane_dense` and a single chunk:
         the kernel owns the lse output and lays the sentinel down itself (no
         XLA-initialised aliased input). Same values on every row.
-      prologue_fault: test-only fault injection (`PROLOGUE_FAULTS`).
+      prologue_fault: test-only fault injection (`PROLOGUE_FAULTS`, and
+        `SEND_FAULTS` with `send_world`).
       kv_write: TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets only:
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
         step's tokens packed for the SparseCore caches, or the same in
@@ -2737,6 +3621,40 @@ def sparse_ragged_paged_attention(
         live-group window rows in one call that reads the top-k as 128-lane
         rows and writes one window array per chunk
         (`prepare_capped_window_live_fused`). Same rows, kv_lens and table.
+      send_world: TPU_DCP_MLA_SEND_LAYOUT. With `lse_in_kernel` taking effect
+        (lane-dense lse, one chunk) and split q, on `send_layout_supported`
+        geometry: the kernel writes the DCP merge's packed real-rows send
+        buffer (`SEND_PAD_ROWS`) for a group of `send_world` ranks, returned
+        in place of the lse; the attention output is then not written.
+      send_exchange: TPU_MLA_FUSED_SMALL_A2A. `(axis, lane_axis or None[,
+        vmem_limit_bytes[, hbm_pin]])` of the (lane, DCP) mesh (the call's
+        scoped VMEM, default SEND_EXCHANGE_VMEM_LIMIT_BYTES; which array
+        operands are pinned to HBM: True = all (default), False = none, or a
+        tuple of SEND_EXCHANGE_PIN_ROLES), with `send_world` on a bucket the
+        attention grid walks in one step, inside a shard_map: the kernel also
+        runs the DCP exchange (see SEND_SLAB_ROW0) and returns the receive
+        buffer int16
+        `[send_world * block, V]` -- `small_all_to_all(send, row0=
+        SEND_SLAB_ROW0)`'s, bit for bit, in every row it writes -- in place of
+        the send buffer. `send_peer`: int32 [2], this rank's (DCP index,
+        lane) as data. `send_recv_in` (optional): a buffer of that shape the
+        result aliases (rows the exchange does not write keep its values).
+      out_pieces: TPU_DCP_MLA_MERGE_PIECES. With `return_lse`,
+        `lse_lane_dense` and `lse_mask_empty`, several chunks, and `out_pieces`
+        equal token pieces that are whole chunks or divide one
+        (`merge_pieces_supported`): each piece's chunks write their outputs and
+        lse into the piece's own buffers instead of threading one q-aliased
+        buffer through every chunk, and the result is their concatenation.
+        Every row the grid writes is bit-identical; rows it never reaches
+        (past the real tokens) keep lse -inf but no longer hold q's values
+        (a merge weights them 0 either way). What changes is the dependency:
+        piece k's rows come from piece k's chunks alone, so a consumer of
+        exactly that piece (the chunked DCP merge's reduce-scatter k) need not
+        wait for the later chunks.
+      out_pieces_fault: test-only: "swap" exchanges pieces 0 and 1.
+      out_pieces_gather_first: With `out_pieces` taken: issue every chunk's
+        gather before any attention and tie the gathers of the chunks after
+        piece 0 to piece 0's buffers with an optimization barrier. Same values.
       packed_rope: SparseCore layout only. `cache_kv_rope` stores each token's
         rope in 16 words, eight tokens per row
         (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
@@ -2808,8 +3726,17 @@ def sparse_ragged_paged_attention(
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
-    if prologue_fault not in PROLOGUE_FAULTS:
+    if prologue_fault not in PROLOGUE_FAULTS + SEND_FAULTS[1:] + (
+        SEND_EXCHANGE_FAULTS if send_exchange is not None else ()
+    ):
         raise ValueError(f"unknown prologue_fault {prologue_fault}")
+    if send_exchange is not None and (
+        not send_world or send_peer is None or len(send_exchange) not in (2, 3, 4, 5)
+    ):
+        raise ValueError(
+            "send_exchange = (axis, lane_axis) needs send_world and send_peer "
+            "(int32 [2]: rank, lane)"
+        )
     if q_rope_table is not None:
         if q_pe is None or q_pe.shape[-1] != Q_ROPE_HEAD_DIM:
             raise ValueError(
@@ -2883,6 +3810,23 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
+    if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
+        raise ValueError("mixed_body_levers: 'pair' and 'xqk' are alternatives")
+    if not set(decode_body_levers) <= set(DECODE_BODY_LEVERS):
+        raise ValueError(
+            f"decode_body_levers {decode_body_levers} not in {DECODE_BODY_LEVERS}"
+        )
+    if "quad" in decode_body_levers and "pair" in decode_body_levers:
+        raise ValueError("decode_body_levers: 'pair' and 'quad' are alternatives")
+    if "zu" in decode_body_levers and "pv512" not in decode_body_levers:
+        # "zu" leaves ROPE rows past kv_len as gathered; only a NOPE-only PV
+        # keeps them out of the output.
+        raise ValueError("decode_body_levers: 'zu' needs 'pv512'")
+    if q_rope_table is None:
+        # "q128" narrows the in-kernel q rope's raw-head DMA; without it
+        # there is nothing to narrow.
+        mixed_body_levers = tuple(v for v in mixed_body_levers if v != "q128")
+        decode_body_levers = tuple(v for v in decode_body_levers if v != "q128")
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
@@ -3072,6 +4016,24 @@ def sparse_ragged_paged_attention(
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
     lse_fill = bool(lse_in_kernel and return_lse and lse_lane_dense and num_chunks == 1)
+    if send_world:
+        if not (lse_fill and q_pe is not None and q.dtype == jnp.bfloat16):
+            raise ValueError(
+                "send_world needs lse_in_kernel on one chunk, split q and bf16 q"
+            )
+        _, send_batch = _chunk_kernel_batch_size(
+            uniform_chunk,
+            attention_kernel_batch_size,
+            small_chunk_tokens,
+            small_chunk_batch_size,
+        )
+        if q.shape[1] != actual_num_q_heads or not send_layout_supported(
+            q.shape[0], q.shape[1], send_world, q.shape[2], send_batch
+        ):
+            raise ValueError(
+                f"send layout unsupported: q {q.shape}, world {send_world}, "
+                f"batch {send_batch}"
+            )
     lse = (
         jnp.full(
             (q.shape[0], num_q_heads)
@@ -3084,16 +4046,38 @@ def sparse_ragged_paged_attention(
         else None
     )
 
-    for i in range(num_chunks):
+    piece_rows = 0
+    if out_pieces > 1 and merge_pieces_supported(
+        q.shape[0], gather_and_attention_chunk_size, out_pieces
+    ):
+        if not (
+            return_lse
+            and lse_lane_dense
+            and lse_mask_empty
+            and not lse_fill
+            and kv_write is None
+        ):
+            raise ValueError(
+                "out_pieces needs return_lse, lse_lane_dense and lse_mask_empty"
+            )
+        piece_rows = max(q.shape[0] // out_pieces, gather_and_attention_chunk_size)
+    if out_pieces_fault not in (None, "swap"):
+        raise ValueError(f"unknown out_pieces_fault {out_pieces_fault}")
+    piece_outs: list[jax.Array] = []
+    piece_lses: list[jax.Array] = []
+
+    def run_chunk(i, chunk_lse, q_in=None, **extra) -> Any:
+        # Any: the checker cannot tell the return_lse / kv_write tuple shapes
+        # of sparse_attention_chunk apart.
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-        result: Any = sparse_attention_chunk(
-            q,
+        return sparse_attention_chunk(
+            q if q_in is None else q_in,
             cache_kv_nope,
             cache_kv_rope,
             kv_lens,
             physical_indices,
-            lse,
+            chunk_lse,
             start_pos=start_pos,
             end_pos=end_pos,
             token_end=cu_q_lens[distribution[2]],
@@ -3136,24 +4120,94 @@ def sparse_ragged_paged_attention(
                 if group_tab is not None and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
                 else ()
             ),
+            row_levers=(
+                decode_body_levers
+                if group_tab is None and fused_prep and decode_row_widths
+                else ()
+            ),
             q_rope_table=q_rope_table,
             lse_fill=lse_fill,
             prologue_fault=prologue_fault,
             kv_write=kv_write,
             kv_write_fault=kv_write_fault,
+            send_world=send_world,
+            send_exchange=send_exchange,
+            send_peer=send_peer,
+            send_recv_in=send_recv_in,
             packed_rope=packed_rope,
+            **extra,
         )
+
+    # Merge pieces, gathers first (`out_pieces_gather_first`): every chunk's
+    # SparseCore gather is issued up front, and the attention of the chunks
+    # after piece 0 waits on all of them together with piece 0's buffers (one
+    # optimization barrier). The gathers then end on the schedule before piece
+    # 0's merge can begin, instead of each just ahead of its own attention
+    # call, so the merge's SparseCore reduce-scatter is not queued behind
+    # gathers the schedule still holds open.
+    pre = [None] * num_chunks
+    gather_first = bool(piece_rows) and out_pieces_gather_first
+    if gather_first:
+        pre = [run_chunk(i, None, gather_only=True) for i in range(num_chunks)]
+    chunks_per_piece = max(1, piece_rows // gather_and_attention_chunk_size)
+
+    prev_out = None
+    for i in range(num_chunks):
+        start_pos = i * gather_and_attention_chunk_size
+        out_piece = None
+        piece_lse = lse
+        if piece_rows:
+            if gather_first and i == chunks_per_piece and i < num_chunks:
+                rest, piece_outs, piece_lses = lax.optimization_barrier(
+                    (pre[i:], piece_outs, piece_lses)
+                )
+                pre[i:] = rest
+            offset = start_pos // piece_rows * piece_rows
+            carried = None
+            if start_pos == offset:
+                # The piece's first chunk: fresh output, fresh -inf lse rows.
+                piece_lse = jnp.full((piece_rows, num_q_heads), -jnp.inf, jnp.float32)
+            else:
+                piece_lse = piece_lses.pop()
+                carried = piece_outs.pop()
+            out_piece = (piece_rows, offset, carried)
+        extra = {"out_piece": out_piece}
+        if pre[i] is not None:
+            extra["pre_gathered"] = pre[i]
+        if piece_rows and i:
+            # Merge pieces leave the attention calls independent, and XLA is
+            # then free to run them in any order (it reversed them). Keep the
+            # incumbent's order -- the merge's chunk order -- by handing call
+            # i its (read-only) q through a barrier with call i-1's output.
+            extra["q_in"], _ = lax.optimization_barrier((q, prev_out))
+        result = run_chunk(i, piece_lse, **extra)
+        prev_out = result[0]
         if kv_write is not None:
             result, (cache_kv_nope, cache_kv_rope) = result
-        if return_lse:
+        if piece_rows:
+            piece_outs.append(result[0])
+            piece_lses.append(result[1])
+        elif return_lse:
             q, lse = result
         else:
             q = result
+
+    if piece_rows:
+        if out_pieces_fault == "swap":
+            piece_outs[0], piece_outs[1] = piece_outs[1], piece_outs[0]
+        q = jnp.concatenate(piece_outs, axis=0)
+        lse = jnp.concatenate(piece_lses, axis=0)
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     caches = () if kv_write is None else (cache_kv_nope, cache_kv_rope)
     if return_lse:
+        # `lse` is the kernel's lse array here; the cast only stops the checker
+        # reading it as the (caches) tuple of the kv_write return shape.
+        lse = cast(jax.Array, lse)
+        if send_world:
+            # `lse` is the send buffer; `out` was not written.
+            return out, lse, *caches
         if lse_lane_dense:
             return out, lse[:, :actual_num_q_heads], *caches
         return out, lse[:, :actual_num_q_heads, 0], *caches
@@ -3264,12 +4318,20 @@ def sparse_attention_chunk(
     group_num_live: jax.Array | None = None,
     group_widths: tuple[int, ...] = (),
     group_levers: tuple[str, ...] = (),
+    row_levers: tuple[str, ...] = (),
     q_rope_table: jax.Array | None = None,
     lse_fill: bool = False,
     prologue_fault: str | None = None,
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
     row_widths: tuple[int, ...] = (),
+    send_world: int = 0,
+    out_piece: tuple[int, int, jax.Array | None] | None = None,
+    gather_only: bool = False,
+    pre_gathered: tuple | None = None,
+    send_exchange: tuple | None = None,
+    send_peer: jax.Array | None = None,
+    send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
@@ -3303,6 +4365,17 @@ def sparse_attention_chunk(
     kernel specializes its body to per grid step (see `_attention_kernel`).
     `kv_write` (with `gather_live_in_indices`): the gather first writes this
     step's packed tokens into both caches; returns `(result, (nope, rope))`.
+    `send_world` (with `lse_fill`; TPU_DCP_MLA_SEND_LAYOUT): the second result
+    is the DCP merge's int16 send buffer (`send_layout_shape`) instead of the
+    lse, and `q`'s aliased output is left unwritten.
+    `out_piece = (rows, offset, carried)` (with `lse`; merge pieces): the
+    output is a `[rows, heads, dim]` buffer holding query rows `[offset,
+    offset + rows)` -- `carried`, the piece's buffer from its previous chunk,
+    or a fresh one when None -- and `lse` is that piece's `[rows, heads]`
+    buffer. `q` is then only read. Returns `(piece_out, piece_lse)`.
+    `gather_only`: issue the chunk's gather and return its buffers
+    `(nope, rope, live_views)` instead of attending; `pre_gathered` is that
+    tuple, handed back to attend without gathering again.
     `packed_rope` (SparseCore layout only): the rope cache holds 16 words per
     token (and `kv_write` writes 16-word rope tokens); the gather returns the
     same padded rows either way.
@@ -3330,6 +4403,8 @@ def sparse_attention_chunk(
             f"topk_cap ({topk_cap}) must be a multiple of {GATHER_ATOM_ROWS} "
             f"dividing topk ({topk})"
         )
+    if send_world and not (lse_fill and q_pe is not None):
+        raise ValueError("send_world needs lse_fill and split q")
     if preserve_suffix and (return_lse or sparsecore_layout):
         raise ValueError("Prefix stores require TensorCore caches without LSE")
     _, num_q_heads, head_dim = q.shape
@@ -3353,6 +4428,12 @@ def sparse_attention_chunk(
         live_views: tuple[jax.Array, jax.Array] | None = None,
     ):
         batch_size = kernel_batch_size
+        out_rows, out_offset, out_carried = (
+            (q.shape[0], 0, None) if out_piece is None else out_piece
+        )
+        if out_piece is not None:
+            assert return_lse and not lse_fill and not preserve_suffix
+            assert lse is not None and lse.shape[0] == out_rows
         lse_shape = (
             (q.shape[0], num_q_heads)
             if lse_fill
@@ -3363,6 +4444,15 @@ def sparse_attention_chunk(
         if lse_fill:
             # Never empty: step 0 lays down the lse sentinel.
             grid = (jnp.maximum(grid[0], 1),)
+        if send_exchange is not None:
+            # The fused exchange runs on a one-step grid (the whole bucket).
+            assert send_world and lse_fill and batch_size == q.shape[0], (
+                send_world,
+                lse_fill,
+                batch_size,
+                q.shape,
+            )
+            grid = (1,)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
@@ -3382,7 +4472,11 @@ def sparse_attention_chunk(
         if return_lse:
             if not lse_fill:
                 in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
+            elif send_recv_in is not None:
+                in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # recv (in)
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
+        if out_carried is not None:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # piece out (in)
 
         # One batch entry's worth of gathered top-k rows, per cache.
         nope_tile = cache_kv_nope.shape[1:]
@@ -3402,6 +4496,22 @@ def sparse_attention_chunk(
         )
 
         bo_double_buf = bq_double_buf
+        if send_world:
+            # Destination-major partial tile: W slabs of bsz * L rows (fused
+            # exchange: SEND_SLAB_ROW0 head rows first, the lse word row last).
+            bo_double_buf = pltpu.VMEM(
+                (
+                    2,
+                    send_world,
+                    (SEND_SLAB_ROW0 if send_exchange is not None else 0)
+                    + batch_size * num_q_heads // send_world,
+                    q.shape[-1],
+                ),
+                jnp.int16,
+            )
+        send_lanes = (
+            send_layout_lanes(q.shape[0], num_q_heads, send_world) if send_world else 0
+        )
 
         scratch_shapes = [
             bkv_nope_double_buf,
@@ -3412,7 +4522,7 @@ def sparse_attention_chunk(
         if return_lse:
             scratch_shapes.append(
                 pltpu.VMEM(
-                    (2, batch_size, num_q_heads)
+                    (2, batch_size, send_lanes or num_q_heads)
                     if lse_lane_dense
                     else (2, batch_size, num_q_heads, 1),
                     jnp.float32,
@@ -3432,7 +4542,20 @@ def sparse_attention_chunk(
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2, 2)),
             ]
-        if lse_fill:
+        if lse_fill and send_world:
+            # Every token's block-reversed lse row, the head rows of the send
+            # blocks (lse word row last) and their DMA semaphore.
+            scratch_shapes += [
+                pltpu.VMEM(
+                    (q.shape[0] // batch_size, batch_size, send_lanes), jnp.float32
+                ),
+                # Fused exchange: (send, recv, local) DMA semaphores instead.
+                pltpu.SemaphoreType.DMA((3,))
+                if send_exchange is not None
+                else pltpu.VMEM((send_world, SEND_PAD_ROWS, q.shape[-1]), jnp.int16),
+                pltpu.SemaphoreType.DMA(()),
+            ]
+        elif lse_fill:
             # The sentinel tile for the whole lse output, and its DMA semaphore.
             assert lse_shape is not None
             scratch_shapes += [
@@ -3445,15 +4568,59 @@ def sparse_attention_chunk(
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, *q_rope_table.shape[1:]), jnp.float32)
             )
+        stage_levers = (
+            tuple(group_levers) if live_views is not None else tuple(row_levers)
+        )
         if split_q:
-            # q_pe double buffer; always the last scratch ref.
+            # q_pe double buffer; the last scratch ref (but for "pair"'s ring).
+            # "q128": only the 128 lanes `load_bq` reads.
+            pe_lanes = 128 if "q128" in stage_levers else q_pe.shape[-1]
             scratch_shapes.append(
-                pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype)
+                pltpu.VMEM((2, batch_size, num_q_heads, pe_lanes), q_pe.dtype)
+            )
+        if "pair" in stage_levers or "quad" in stage_levers:
+            # Body lever "pair": unpacked KV of a token pair, two pair slots
+            # ("quad": one slot of the whole step's tokens).
+            pair_head_dim = (
+                align_to(q.shape[-1] + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128)
+                if split_q
+                else q.shape[-1]
+            )
+            assert sparsecore_layout
+            scratch_shapes.append(
+                pltpu.VMEM(
+                    (1, batch_size, cache_kv_nope.shape[1], pair_head_dim)
+                    if "quad" in stage_levers
+                    else (2, 2, cache_kv_nope.shape[1], pair_head_dim),
+                    jnp.float8_e4m3fn,
+                )
             )
 
+        xchg_merge = bool(
+            send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
+        )
+        if xchg_merge:
+            # Merge mode: the receive scratch, the last scratch ref.
+            assert send_recv_in is None, "merge mode has no receive buffer"
+            scratch_shapes.append(
+                pltpu.VMEM(
+                    (
+                        send_world,
+                        SEND_SLAB_ROW0 + batch_size * num_q_heads // send_world,
+                        q.shape[-1],
+                    ),
+                    jnp.int16,
+                )
+            )
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
             bounds.append(token_end)
+        if send_exchange is not None:
+            # (rank, lane) ride the bounds prefetch: no extra operand.
+            assert not preserve_suffix and send_peer is not None
+            bounds += [send_peer[0], send_peer[1]]
+            if xchg_merge:
+                bounds.append(send_peer[2])  # real tokens
         scalar_prefetches = (
             kv_lens,
             jnp.array(bounds, jnp.int32),
@@ -3479,7 +4646,15 @@ def sparse_attention_chunk(
             lse_fill=lse_fill,
             fault=prologue_fault,
             row_widths=tuple(row_widths) if capped_windows is not None else (),
+            send_world=send_world,
+            out_row_offset=out_offset,
+            out_in=out_carried is not None,
+            send_exchange=send_exchange,
+            recv_in=send_recv_in is not None,
         )
+        if live_views is None and row_levers and row_widths and capped_windows:
+            # Decode body levers on the row-widths body.
+            kernel_body = functools.partial(kernel_body, body_levers=tuple(row_levers))
         if live_views is not None:
             group_body = functools.partial(
                 kernel_body,
@@ -3498,7 +4673,21 @@ def sparse_attention_chunk(
         )
         if capped_windows is not None:
             scope_name += f"-capw_{capped_windows}"
+        if send_exchange is not None:
+            scope_name += "-xa2a"
         num_prefetch = len(scalar_prefetches)
+        # Merge pieces: q is read-only; the lse input (and the carried piece
+        # output, the operand after it) alias the two outputs.
+        lse_operand = (
+            num_prefetch
+            + 3
+            + int(split_q)
+            + int(q_rope)
+            + 2 * int(live_views is not None)
+        )
+        piece_aliases = {lse_operand: 1}
+        if out_carried is not None:
+            piece_aliases[lse_operand + 1] = 0
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 kernel_body,
@@ -3511,19 +4700,71 @@ def sparse_attention_chunk(
                 ),
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=vmem_limit_bytes,
+                    vmem_limit_bytes=(
+                        min(
+                            vmem_limit_bytes,
+                            send_exchange[2]
+                            if len(send_exchange) > 2
+                            else SEND_EXCHANGE_VMEM_LIMIT_BYTES,
+                        )
+                        if send_exchange is not None
+                        else vmem_limit_bytes
+                    ),
                     disable_bounds_checks=True,
+                    # pyrefly: ignore[bad-argument-type]
+                    **(
+                        {"collective_id": SEND_EXCHANGE_COLLECTIVE_ID}
+                        if send_exchange is not None
+                        else {}
+                    ),
                 ),
                 out_shape=(
                     [
-                        jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                        jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
+                        jax.ShapeDtypeStruct(
+                            shape=(out_rows, *q.shape[1:]), dtype=q.dtype
+                        ),
+                        jax.ShapeDtypeStruct(
+                            # Merge mode: the merged rows' words [T * L, V].
+                            shape=(q.shape[0] * num_q_heads // send_world, q.shape[-1]),
+                            dtype=jnp.int16,
+                        )
+                        if xchg_merge
+                        else jax.ShapeDtypeStruct(
+                            # Fused exchange: the receive buffer, flat.
+                            shape=(
+                                int(
+                                    np.prod(
+                                        send_layout_shape(
+                                            q.shape[0],
+                                            num_q_heads,
+                                            send_world,
+                                            q.shape[-1],
+                                        )[:2]
+                                    )
+                                ),
+                                q.shape[-1],
+                            ),
+                            dtype=jnp.int16,
+                        )
+                        if send_exchange is not None
+                        else jax.ShapeDtypeStruct(
+                            shape=send_layout_shape(
+                                q.shape[0], num_q_heads, send_world, q.shape[-1]
+                            ),
+                            dtype=jnp.int16,
+                        )
+                        if send_world
+                        else jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
                     ]
                     if return_lse
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
                 ),
                 input_output_aliases=(
-                    {num_prefetch: 0}
+                    piece_aliases
+                    if out_piece is not None
+                    else {num_prefetch: 0, lse_operand: 1}
+                    if lse_fill and send_recv_in is not None
+                    else {num_prefetch: 0}
                     if lse_fill
                     else {
                         num_prefetch: 0,
@@ -3544,14 +4785,36 @@ def sparse_attention_chunk(
             )
         )
         operands = [q, cache_kv_nope, cache_kv_rope]
+        roles = ["q", "kv", "kv"]
         if split_q:
             operands.append(q_pe)
+            roles.append("q_pe")
         if q_rope:
             operands.append(q_rope_table)
+            roles.append("tab")
         if live_views is not None:
             operands += list(live_views)
+            roles += ["kv"] * len(live_views)
         if return_lse and not lse_fill:
             operands.append(lse)
+            roles.append("lse")
+        elif return_lse and send_recv_in is not None:
+            operands.append(send_recv_in)
+            roles.append("recv")
+        if out_carried is not None:
+            operands.append(out_carried)
+            roles.append("out")
+        if send_exchange is not None:
+            pin = send_exchange[3] if len(send_exchange) > 3 else True
+            # True: every array operand; a tuple of roles (SEND_EXCHANGE_PIN_ROLES):
+            # only those -- e.g. ("kv",) keeps the gathered KV in HBM (XLA would
+            # stage it into VMEM ahead of the call) and leaves q where XLA puts it.
+            operands = [
+                pltpu.with_memory_space_constraint(x, pltpu.HBM)
+                if pin is True or (pin and r in pin)
+                else x
+                for x, r in zip(operands, roles)
+            ]
         return kernel(*scalar_prefetches, *operands)
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
@@ -3602,6 +4865,12 @@ def sparse_attention_chunk(
     # `kernel_batch_size`.
     valid_rows = jnp.maximum(0, jnp.minimum(token_end, end_pos) - start_pos)
     batch_end = start_pos + cdiv(valid_rows, kernel_batch_size) * kernel_batch_size
+    # Decode lever "step8": the attention grid's own step (the prep and the
+    # gather above keep `kernel_batch_size`).
+    attn_batch_size, attn_batch_end = kernel_batch_size, batch_end
+    if "step8" in row_levers and small_chunk:
+        attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP8_TOKENS)
+        attn_batch_end = start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
     num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
     # For prefilling of short sequences (or early in the sequence), there are
@@ -3616,151 +4885,167 @@ def sparse_attention_chunk(
     live_views = None
     if group_tab is not None and topk_cap is None:
         raise ValueError("group_tab requires topk_cap")
-    if topk_cap is not None:
-        # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
-        # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
-        # slice. The live bound reaches the last window any gridded row needs
-        # (always window 0's live rows, so a chunk without overflow gathers
-        # exactly `(batch_end - start) * topk_cap` rows).
-        assert capped_windows is not None
-        gather_atoms = sparsecore_atoms_per_batch
-        if small_chunk and small_chunk_live_gather:
-            gather_atoms = small_chunk_gather_atoms
-        live_tokens = batch_end - start_pos
-        if gather_live_in_indices:
-            # `window_indices` is then the fused prep's 128-lane form: hand it
-            # to the gather flat (a bitcast, no relayout); its live vector
-            # sits right after the chunk's rows.
-            live_kwargs = dict(live_vec_offset=chunk_size * topk, linear_indices=True)
-        elif group_tab is not None:
-            # Live-group prep: 128-lane linear rows, bound from the table.
-            assert window_indices is not None and group_num_live is not None
-            live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
-        else:
-            token_windows = jnp.where(
-                jnp.arange(chunk_size) < live_tokens,
-                (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
-                1,
-            )
-            live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
-            num_live_capped = (live_windows - 1) * chunk_size * topk_cap + jnp.maximum(
-                0, live_tokens
-            ) * topk_cap
-            live_kwargs = dict(num_live_indices=num_live_capped)
-        if window_indices is None:
-            assert indices is not None
-            window_indices = (
-                indices.reshape(chunk_size, capped_windows, topk_cap)
-                .transpose(1, 0, 2)
-                .reshape(capped_windows * chunk_size, topk_cap)
-            )
-        row_live_atoms = None
-        if capped_live_rows and group_tab is None and kv_write is None:
-            # Not with live groups: they already bound the gather per grid
-            # step, on a layout that is not window-major rows. Not with
-            # kv_write (TPU_MLA_KV_WRITE_IN_GATHER): the gather's write phase
-            # plus the row-atoms operand hangs the SparseCore kernel.
-            # Window w of a gridded token holds prefix-packed slots [w*cap, (w+1)*cap).
-            window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
-            live_slots = jnp.clip(
-                kv_lens[start_pos:end_pos][None, :] - window_start[:, None], 0, topk_cap
-            )
-            live_slots = jnp.where(jnp.arange(chunk_size) < live_tokens, live_slots, 0)
-            row_live_atoms = (
-                (live_slots + GATHER_ATOM_ROWS - 1) // GATHER_ATOM_ROWS
-            ).reshape(-1)
-        gathered = native_sc_gather.dsa_gather_native_sc(
-            cache_kv_nope,
-            cache_kv_rope,
-            window_indices,
-            out_size=chunk_size * topk,
-            atoms_per_batch=gather_atoms,
-            wait_mode=sparsecore_gather_wait_mode,
-            serve_pipelined=sparsecore_gather_pipelined,
-            # No is_dcp_mode: capped liveness is `num_live_capped` (or the
-            # fused prep's `live_vec`, or the live-group bound), not -1.
-            live_multiple=kernel_batch_size
-            * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
-            row_live_atoms=row_live_atoms,
-            kv_write=kv_write,
-            write_fault=kv_write_fault,
-            packed_rope=packed_rope,
-            **live_kwargs,
-        )
-        gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
+    if pre_gathered is not None:
+        # Merge pieces with the gathers issued first (`gather_only` pass).
+        gathered_nope_buffer, gathered_rope_buffer, live_views = pre_gathered
         if kv_write is not None:
-            cache_kv_nope, cache_kv_rope = gathered[2:]
-        gathered_nope_buffer = gathered_nope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap, 128
-        )
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
-        )
-        if group_tab is not None:
-            block = kernel_batch_size * GATHER_ATOM_ROWS
-            live_views = (
-                gathered_nope_buffer.reshape(
-                    chunk_size * topk // block, kernel_batch_size, GATHER_ATOM_ROWS, 128
-                ),
-                gathered_rope_buffer.reshape(
-                    chunk_size * topk // block,
-                    kernel_batch_size,
-                    GATHER_ATOM_ROWS // native_sc_gather.ROPE_PACKING,
-                    128,
-                ),
-            )
-    elif sparsecore_layout:
-        live_kwargs = {}
-        gather_atoms = sparsecore_atoms_per_batch
-        if small_chunk and small_chunk_live_gather:
-            gather_atoms = small_chunk_gather_atoms
-            live_kwargs = dict(
-                num_live_indices=num_valid_indices,
-                live_multiple=kernel_batch_size * topk,
-            )
-        elif live_gather_all_chunks:
-            live_kwargs = dict(
-                num_live_indices=num_valid_indices,
-                live_multiple=kernel_batch_size * topk,
-            )
-        gathered_nope_buffer, gathered_rope_buffer = (
-            native_sc_gather.dsa_gather_native_sc(
+            raise ValueError("pre_gathered does not carry kv_write caches")
+    else:
+        if topk_cap is not None:
+            # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
+            # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
+            # slice. The live bound reaches the last window any gridded row needs
+            # (always window 0's live rows, so a chunk without overflow gathers
+            # exactly `(batch_end - start) * topk_cap` rows).
+            assert capped_windows is not None
+            gather_atoms = sparsecore_atoms_per_batch
+            if small_chunk and small_chunk_live_gather:
+                gather_atoms = small_chunk_gather_atoms
+            if gather_live_in_indices:
+                # `window_indices` is then the fused prep's 128-lane form: hand it
+                # to the gather flat (a bitcast, no relayout); its live vector
+                # sits right after the chunk's rows.
+                live_kwargs = dict(
+                    live_vec_offset=chunk_size * topk, linear_indices=True
+                )
+            elif group_tab is not None:
+                # Live-group prep: 128-lane linear rows, bound from the table.
+                assert window_indices is not None and group_num_live is not None
+                live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
+            else:
+                live_tokens = batch_end - start_pos
+                token_windows = jnp.where(
+                    jnp.arange(chunk_size) < live_tokens,
+                    (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1)
+                    // topk_cap,
+                    1,
+                )
+                live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
+                num_live_capped = (
+                    live_windows - 1
+                ) * chunk_size * topk_cap + jnp.maximum(0, live_tokens) * topk_cap
+                live_kwargs = dict(num_live_indices=num_live_capped)
+                if capped_live_rows:
+                    # TPU_SPARSE_MLA_LIVE_GATHER (#1948): window w of a gridded
+                    # token holds prefix-packed slots [w*cap, (w+1)*cap); gather
+                    # only each (window, token) row's live 64-slot atoms.
+                    window_start = topk_cap * jnp.arange(
+                        capped_windows, dtype=jnp.int32
+                    )
+                    live_slots = jnp.clip(
+                        kv_lens[start_pos:end_pos][None, :] - window_start[:, None],
+                        0,
+                        topk_cap,
+                    )
+                    live_slots = jnp.where(
+                        jnp.arange(chunk_size) < live_tokens, live_slots, 0
+                    )
+                    live_kwargs["row_live_atoms"] = (
+                        (live_slots + GATHER_ATOM_ROWS - 1) // GATHER_ATOM_ROWS
+                    ).reshape(-1)
+            if window_indices is None:
+                assert indices is not None
+                window_indices = (
+                    indices.reshape(chunk_size, capped_windows, topk_cap)
+                    .transpose(1, 0, 2)
+                    .reshape(capped_windows * chunk_size, topk_cap)
+                )
+            gathered = native_sc_gather.dsa_gather_native_sc(
                 cache_kv_nope,
                 cache_kv_rope,
-                indices,
+                window_indices,
                 out_size=chunk_size * topk,
-                atoms_per_batch=(dcp_gather_atoms if is_dcp_mode else gather_atoms),
+                atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
-                **({"is_dcp_mode": True} if is_dcp_mode else {}),
+                live_multiple=kernel_batch_size
+                * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
+                kv_write=kv_write,
+                write_fault=kv_write_fault,
                 packed_rope=packed_rope,
                 **live_kwargs,
             )
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
-        )
-    else:
-        assert indices is not None
-        gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
-            cache_kv_nope,
-            cache_kv_rope,
-            indices.reshape(-1),
-            num_valid_indices=num_valid_indices,
-            # Non-DCP calls stay byte-identical to the pre-#1477 signature.
-            **(
-                {"num_row_subchunks": tc_num_row_subchunks, "is_dcp_mode": True}
-                if is_dcp_mode
-                else {}
-            ),
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(
-            chunk_size,
-            topk * kv_cache_utils.WORD_BYTES,
-            kv_cache_utils.TILE_LANE_BYTES,
-        )
-        gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk, -1)
+            gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
+            if kv_write is not None:
+                cache_kv_nope, cache_kv_rope = gathered[2:]
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                capped_windows * chunk_size, topk_cap, 128
+            )
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                capped_windows * chunk_size,
+                topk_cap // native_sc_gather.ROPE_PACKING,
+                128,
+            )
+            if group_tab is not None:
+                block = kernel_batch_size * GATHER_ATOM_ROWS
+                live_views = (
+                    gathered_nope_buffer.reshape(
+                        chunk_size * topk // block,
+                        kernel_batch_size,
+                        GATHER_ATOM_ROWS,
+                        128,
+                    ),
+                    gathered_rope_buffer.reshape(
+                        chunk_size * topk // block,
+                        kernel_batch_size,
+                        GATHER_ATOM_ROWS // native_sc_gather.ROPE_PACKING,
+                        128,
+                    ),
+                )
+        elif sparsecore_layout:
+            live_kwargs = {}
+            gather_atoms = sparsecore_atoms_per_batch
+            if small_chunk and small_chunk_live_gather:
+                gather_atoms = small_chunk_gather_atoms
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
+            elif live_gather_all_chunks:
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
+            gathered_nope_buffer, gathered_rope_buffer = (
+                native_sc_gather.dsa_gather_native_sc(
+                    cache_kv_nope,
+                    cache_kv_rope,
+                    indices,
+                    out_size=chunk_size * topk,
+                    atoms_per_batch=(dcp_gather_atoms if is_dcp_mode else gather_atoms),
+                    wait_mode=sparsecore_gather_wait_mode,
+                    serve_pipelined=sparsecore_gather_pipelined,
+                    **({"is_dcp_mode": True} if is_dcp_mode else {}),
+                    packed_rope=packed_rope,
+                    **live_kwargs,
+                )
+            )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+            )
+        else:
+            assert indices is not None
+            gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
+                cache_kv_nope,
+                cache_kv_rope,
+                indices.reshape(-1),
+                num_valid_indices=num_valid_indices,
+                # Non-DCP calls stay byte-identical to the pre-#1477 signature.
+                **(
+                    {"num_row_subchunks": tc_num_row_subchunks, "is_dcp_mode": True}
+                    if is_dcp_mode
+                    else {}
+                ),
+            )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                chunk_size,
+                topk * kv_cache_utils.WORD_BYTES,
+                kv_cache_utils.TILE_LANE_BYTES,
+            )
+            gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk, -1)
+    if gather_only:
+        return gathered_nope_buffer, gathered_rope_buffer, live_views
     # We treat each query token as a one independent sequence, attend to their
     # respective gathered kv tokens in the `gathered_kv_buffer`.
     # -1 in topk_indices is padded elements at the end of each row.
@@ -3770,8 +5055,8 @@ def sparse_attention_chunk(
         gathered_rope_buffer,
         kv_lens,
         start_seq_idx=start_pos,
-        end_seq_idx=batch_end,
-        kernel_batch_size=kernel_batch_size,
+        end_seq_idx=attn_batch_end,
+        kernel_batch_size=attn_batch_size,
         lse=lse,
         is_dcp_mode=is_dcp_mode,
         live_views=live_views,

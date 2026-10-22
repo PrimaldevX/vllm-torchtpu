@@ -192,6 +192,81 @@ def _input_permutation(
     return perm
 
 
+def _scalar_values(graph: fx.GraphModule) -> tuple[Any, ...]:
+    """Per placeholder: None for a tensor, else the scalar's value (a SymInt's
+    sympy expression, or a plain int), for :func:`_scalar_adapter`."""
+    out = []
+    for node in _placeholder_nodes(graph):
+        value = _placeholder_value(node)
+        if isinstance(value, torch.SymInt):
+            out.append(value.node.expr)
+        elif isinstance(value, int):
+            out.append(value)
+        else:
+            out.append(None)
+    return tuple(out)
+
+
+def _concretize(expr: Any, size: int) -> int:
+    """vLLM's own substitution for a single-size compile
+    (`piecewise_backend.create_concrete_args`): every symbol takes the bucket
+    size."""
+    if isinstance(expr, int):
+        return expr
+    return int(expr.subs({symbol: size for symbol in expr.free_symbols}))
+
+
+def _scalar_adapter(
+    stored: Sequence[tuple[str, Any]],
+    stored_scalars: Sequence[Any],
+    current: Sequence[tuple[str, Any]],
+    current_scalars: Sequence[Any],
+    size: int | None,
+) -> tuple[Callable[[tuple], tuple], list[str]] | None:
+    """Map this trace's arguments onto a stored executable whose input list
+    differs only in its scalar (SymInt) inputs, or None.
+
+    Two traces of one model can lift a different set of SymInts while lifting
+    the same tensors: a symbol one side of a token-count branch reads and the
+    other never touches (a second dynamic dim, say the positions' length, that
+    one side ties to the token count and the other leaves free) is a graph
+    input on one side only. That is no reason to refuse the hand-over. A
+    bucket's executable is compiled for one size, with every symbol
+    substituted by that size (`create_concrete_args`), so each of its scalar
+    inputs can only ever take the value it was compiled with -- its tensors
+    would not match otherwise. So a scalar only the stored side takes is
+    passed that constant, and one only this side takes is dropped. Tensors
+    still have to match exactly (by name, else by position): a buffer one side
+    lifts and the other does not is still refused.
+    """
+    if size is None:
+        return None
+    stored_t = [i for i, v in enumerate(stored_scalars) if v is None]
+    current_t = [i for i, v in enumerate(current_scalars) if v is None]
+    if len(stored_t) != len(current_t):
+        return None
+    by_name = {current[i]: i for i in current_t}
+    source: list[int] = [by_name.get(stored[i], -1) for i in stored_t]
+    if -1 in source or len(set(source)) != len(source):
+        # Renamed placeholders: match the tensors by position, dtype and shape.
+        if any(stored[i][1] != current[j][1] for i, j in zip(stored_t, current_t)):
+            return None
+        source = list(current_t)
+    plan: list[tuple[bool, Any]] = [(False, None)] * len(stored)
+    for i, j in zip(stored_t, source):
+        plan[i] = (True, j)
+    filled = []
+    for i, value in enumerate(stored_scalars):
+        if value is not None:
+            plan[i] = (False, _concretize(value, size))
+            filled.append(f"{stored[i][0]}={value}->{plan[i][1]}")
+
+    def adapt(args: tuple) -> tuple:
+        return tuple(args[x] if is_arg else x for is_arg, x in plan)
+
+    return adapt, filled
+
+
 def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
     """The inputs only one of two traces takes, most frequent first."""
 
@@ -205,6 +280,43 @@ def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
         f"{len(stored)} inputs vs {len(current)}. "
         f"Only in the earlier trace: {render(Counter(stored) - Counter(current))}. "
         f"Only in this one: {render(Counter(current) - Counter(stored))}"
+    )
+
+
+def _non_tensor_inputs(graph: fx.GraphModule) -> dict[str, str]:
+    """The submodule's non-tensor arguments (SymInts), by name: what they
+    stand for, for the hand-over error."""
+    out = {}
+    for node in _placeholder_nodes(graph):
+        value = _placeholder_value(node)
+        if value is not None and not isinstance(value, torch.Tensor):
+            out[node.name] = str(value)
+    return out
+
+
+def _named_delta(
+    stored: Sequence[tuple[str, Any]],
+    current: Sequence[tuple[str, Any]],
+    stored_scalars: dict[str, str],
+    current_scalars: dict[str, str],
+) -> str:
+    """The inputs, by name, only one of two traces takes (at most 8 each)."""
+
+    def render(entries: list[tuple[str, Any]], scalars: dict[str, str]) -> str:
+        if not entries:
+            return "nothing"
+        shown = [
+            f"{name}={scalars[name]}" if name in scalars else f"{name}:{meta}"
+            for name, meta in entries[:8]
+        ]
+        more = f" (+{len(entries) - 8} more)" if len(entries) > 8 else ""
+        return ", ".join(shown) + more
+
+    only_stored = [e for e in stored if e not in set(current)]
+    only_current = [e for e in current if e not in set(stored)]
+    return (
+        f"by name, only in the earlier trace: {render(only_stored, stored_scalars)}; "
+        f"only in this one: {render(only_current, current_scalars)}"
     )
 
 
@@ -246,30 +358,65 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple, tuple]
+            tuple[str | None, str],
+            tuple[Callable[..., Any], tuple, tuple, dict[str, str], tuple],
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
     def get(
-        self, cache_dir: str | None, key: str, graph: fx.GraphModule
+        self,
+        cache_dir: str | None,
+        key: str,
+        graph: fx.GraphModule,
+        size: int | None = None,
     ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, stored, stored_signature = found
+        runnable, stored, stored_signature, stored_named, stored_scalars = found
         current = _handover_inputs(graph)
         if stored == current:
             return runnable
+        perm = None
         if sorted(name for name, _ in stored) != sorted(name for name, _ in current):
             # Renamed placeholders: match by position, dtype and shape.
             signature = _signature(graph)
             if signature == stored_signature:
                 return runnable
-            raise _handover_error(key, _signature_delta(stored_signature, signature))
-        perm = _input_permutation(stored, current)
+            delta = _signature_delta(stored_signature, signature)
+        else:
+            perm = _input_permutation(stored, current)
+            delta = _signature_delta(stored, current)
         if perm is None:
-            raise _handover_error(key, _signature_delta(stored, current))
+            adapter = _scalar_adapter(
+                stored, stored_scalars, current, _scalar_values(graph), size
+            )
+            if adapter is None:
+                raise _handover_error(
+                    key,
+                    delta
+                    + "; "
+                    + _named_delta(
+                        stored, current, stored_named, _non_tensor_inputs(graph)
+                    ),
+                )
+            adapt, filled = adapter
+            logger.info(
+                "[shape-variants] %s handed over across a scalar-input difference "
+                "(%d inputs vs %d; the executable's own scalars as compiled for "
+                "%d tokens: %s)",
+                key,
+                len(stored),
+                len(current),
+                size,
+                ", ".join(filled) or "none",
+            )
+
+            def adapted(*args: Any) -> Any:
+                return runnable(*adapt(args))
+
+            return adapted
         logger.info(
             "[shape-variants] %s handed over with %d of %d inputs reordered",
             key,
@@ -295,6 +442,8 @@ class BucketExecutables:
             runnable,
             _handover_inputs(graph),
             _signature(graph),
+            _non_tensor_inputs(graph),
+            _scalar_values(graph),
         )
 
     def needs_retrace(self, size: int) -> bool:
@@ -342,7 +491,7 @@ def runnable_for(
     Refusing here leaves the bucket to the trace that owns it, which is the
     only one that can rebuild a wrapper matching the executable.
     """
-    ready = _session.get(cache_dir, key, graph) if _session else None
+    ready = _session.get(cache_dir, key, graph, size) if _session else None
     if ready is not None:
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready

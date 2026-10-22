@@ -274,3 +274,105 @@ def test_scale_dma_applies():
     assert not fp8_skinny.scale_dma_applies(6144, 2688)  # q_a + kv_a
     for k, n in fp8_skinny.SCALE_DMA_SITES:
         assert (k, n) in fp8_skinny.TUNED and n % 1024 == 0
+
+
+# --------------------------------------------------------------------------------
+# hbm_pin (TPU_FP8_SKINNY_HBM_PIN_SITES): the weight operand constrained to HBM.
+# --------------------------------------------------------------------------------
+
+PIN_SITES = [(2048, 16384), (2048, 8192), (1024, 6144), (6144, 1536), (6144, 2688)]
+
+
+def _weight_vmem_lines(hlo: str, k: int, n: int) -> list[str]:
+    """Compiled-HLO instructions that stage the [1, k, n] fp8 weight into VMEM:
+    an instruction whose own result is that shape and is either an async
+    copy/slice or laid out in memory space 1 (`S(1)`). The custom call itself
+    (a bf16 result) is not one of them."""
+    shape = f"f8e4m3fn[1,{k},{n}]"
+    out = []
+    for ln in hlo.splitlines():
+        m = re.match(r"\s*(?:ROOT )?%?\S+ = (.+?) ([a-z][\w-]*)\(", ln)
+        if not m:
+            continue
+        result, opcode = m.group(1), m.group(2)  # result: a shape or a tuple
+        mine = [t for t in result.strip("()").split(", ") if t.startswith(shape)]
+        if mine and (
+            opcode in ("copy-start", "copy-done", "slice-start", "slice-done")
+            or any("S(1)" in t for t in mine)
+        ):
+            out.append(ln.strip())
+    return out
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("k,n", PIN_SITES)
+@pytest.mark.parametrize("sd", [False, True])
+def test_hbm_pin_is_bit_identical(k, n, sd):
+    x = _x(16, k, 4)
+    wq, ws = _w(k, n)
+    sd = sd and fp8_skinny.scale_dma_applies(k, n)
+
+    def f(pin):
+        return jax.jit(
+            lambda a, b, c: fp8_skinny.fp8_skinny_matmul(
+                a, b, c, hbm_pin=pin, scale_dma=sd
+            )
+        )(x, wq, ws)
+
+    np.testing.assert_array_equal(
+        np.asarray(f(True), np.float32), np.asarray(f(False), np.float32)
+    )
+
+
+@pytest.mark.tpu_test
+def test_hbm_pin_stacked_eager_bit_identical():
+    """The constraint cannot run eagerly; the pinned path jits itself."""
+    k, n = 1024, 6144
+    x = _x(16, k, 16)
+    ws_list = [_w(k, n, seed=s) for s in (3, 4)]
+    stack = jnp.stack([w for w, _ in ws_list])
+    for i, (_, ws) in enumerate(ws_list):
+        idx = jnp.array([i], jnp.int32)
+        y0 = fp8_skinny.fp8_skinny_matmul_stacked(x, stack, idx, ws)
+        y1 = fp8_skinny.fp8_skinny_matmul_stacked(x, stack, idx, ws, hbm_pin=True)
+        y2 = fp8_skinny.fp8_skinny_matmul_stacked(
+            x, stack, idx, ws, hbm_pin=True, scale_dma=True
+        )
+        for y in (y1, y2):
+            np.testing.assert_array_equal(
+                np.asarray(y0, np.float32), np.asarray(y, np.float32)
+            )
+
+
+# staged: whether XLA stages the unpinned weight in this standalone module (the
+# positive control). q_b's 16 MiB is not staged standalone; it is in the model.
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "k,n,staged", [(1024, 6144, True), (2048, 8192, True), (2048, 16384, False)]
+)
+def test_hbm_pin_lowers_to_hbm_color_and_no_vmem_staging(k, n, staged):
+    """Pinned: the custom call carries `input_memory_space_colors` and the compiled
+    module never stages the weight in VMEM (no copy-start / copy-done / slice-start
+    and no S(1) result of its shape). Positive control: the unpinned module does
+    stage it (the in_spec's memory_space alone does not reach XLA)."""
+    x = _x(16, k, 4)
+    wq, ws = _w(k, n)
+    sd = fp8_skinny.scale_dma_applies(k, n)
+
+    def lowered(pin):
+        return jax.jit(
+            lambda a, b, c: fp8_skinny.fp8_skinny_matmul(
+                a, b, c, hbm_pin=pin, scale_dma=sd
+            )
+        ).lower(x, wq, ws)
+
+    pinned, unpinned = lowered(True), lowered(False)
+    assert "input_memory_space_colors" in pinned.as_text()
+    pinned_hlo = pinned.compile().as_text()
+    unpinned_hlo = unpinned.compile().as_text()
+    print(f"unpinned VMEM staging of the weight ({k},{n}):")
+    for ln in _weight_vmem_lines(unpinned_hlo, k, n):
+        print("  ", ln[:200])
+    if staged:
+        assert _weight_vmem_lines(unpinned_hlo, k, n), "no staging to remove here"
+    assert _weight_vmem_lines(pinned_hlo, k, n) == []

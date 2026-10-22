@@ -24,10 +24,16 @@ class _PendingTiming:
 class RunnerStageTiming:
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, enabled: bool = True):
         self._rank = str(rank)
         self._cpu_samples: list[tuple[str, str, float]] = []
         self._device_samples: list[tuple[str, str, float]] = []
+        # Disabled: every stage is a no-op (no TpuEvent records, no collector
+        # thread) and take_samples() stays empty. Used when nothing consumes the
+        # samples, so serving pays no per-step event records or GIL wakeups.
+        self._enabled = enabled
+        if not enabled:
+            return
         # Check Event support before serving; synchronization stays off the
         # serving thread after startup.
         event = TpuEvent()
@@ -51,14 +57,24 @@ class RunnerStageTiming:
                 self._device_samples.append((self._rank, pending.stage, seconds))
             self._slots.release()
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
+        if not self._enabled:
+            yield
+            return
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._enabled:
+            yield
+            return
         if not self._slots.acquire(blocking=False):
             with self.host_stage(stage):
                 yield
@@ -83,6 +99,8 @@ class RunnerStageTiming:
         self,
     ) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
         cpu, self._cpu_samples = self._cpu_samples, []
+        if not self._enabled:
+            return cpu, []
         with self._samples_lock:
             device, self._device_samples = self._device_samples, []
         return cpu, device

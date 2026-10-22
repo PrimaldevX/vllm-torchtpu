@@ -63,6 +63,13 @@ FP8_BLOCK = 128
 P = mla_op.mla_rope_half_split_perm(ROPE)
 
 
+@pytest.fixture(autouse=True)
+def _rope_path_without_fused_qprep(monkeypatch):
+    """The rope paths this file compares; the fused q-prep kernel (on by default
+    since trial 4, a TPU-only Pallas op) is covered by its own tests."""
+    monkeypatch.setenv("TPU_INDEXER_QPREP_FUSED", "0")
+
+
 class _StubIndexerCache(DeepseekV32IndexerCache):
     def __init__(self, head_dim, dtype, prefix, cache_config):
         torch.nn.Module.__init__(self)

@@ -75,3 +75,36 @@ def exact_sum(terms):
 
 def within(got, want, tolerance):
     return np.abs(got.astype(np.float64) - want) <= tolerance
+
+
+def custom_call_operands_in_vmem(hlo_text, kernel_prefix):
+    """For every ``tpu_custom_call`` whose name starts with ``kernel_prefix`` in
+    a compiled (after-optimizations) HLO module: the operands whose value XLA
+    placed in VMEM (``S(1)`` in the layout), followed through bitcasts.
+    Returns {call name: [operand names]}."""
+    import re
+
+    defs = {}
+    for line in hlo_text.splitlines():
+        m = re.match(r"\s*(?:ROOT )?%(\S+) = (.*)", line)
+        if m:
+            defs[m.group(1)] = m.group(2)
+
+    def in_vmem(name):
+        rhs = defs.get(name, "")
+        shape = rhs.split(" ", 1)[
+            0
+        ]  # an array shape with its layout, e.g. s32[8192]{0:T(1024)S(1)}
+        if "S(1)" in shape:
+            return True
+        m = re.search(r" bitcast\(%([\w.\-]+)", rhs)
+        return bool(m) and in_vmem(m.group(1))
+
+    found = {}
+    for name, rhs in defs.items():
+        if not name.startswith(kernel_prefix) or "custom-call(" not in rhs:
+            continue
+        args = rhs.split("custom-call(", 1)[1].split(")", 1)[0]
+        ops = re.findall(r"%([\w.\-]+)", args)
+        found[name] = [o for o in ops if in_vmem(o)]
+    return found

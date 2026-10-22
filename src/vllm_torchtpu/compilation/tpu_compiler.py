@@ -13,6 +13,7 @@ import glob
 import hashlib
 import importlib.util
 import json
+import operator
 import os
 import pickle
 import re
@@ -98,16 +99,58 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
+# Nodes the fingerprint may drop when nothing reads them: views and copies
+# with no side effect. Everything else -- custom ops above all, which can write
+# a cache in place without saying so in their schema -- is kept even when dead.
+_DEAD_VIEW_FUNCTIONS = frozenset({operator.getitem})
+_DEAD_VIEW_METHODS = frozenset({"contiguous", "view", "reshape", "float", "to"})
+
+
+def _keep_if_dead(node: fx.Node) -> bool:
+    if node.op == "call_function":
+        return node.target not in _DEAD_VIEW_FUNCTIONS
+    if node.op == "call_method":
+        return node.target not in _DEAD_VIEW_METHODS
+    return node.op != "get_attr"
+
+
+def _without_dead_views(graph: fx.GraphModule) -> fx.GraphModule:
+    """A copy of `graph` without the dead views `_keep_if_dead` allows to go.
+
+    A dead node is not in the program, but it is in the code, and it can carry
+    a rank: with VLLM_DCP_Q_REPLICATE vLLM's column-parallel `_local_view`
+    slices this rank's heads (`out[..., start : start + n, :]`, start from the
+    TP rank) and the MLA path never reads the slice. Left in, it gives every
+    rank its own fingerprint and nothing is ever replayed. Only side-effect-free
+    views are dropped, so a dead op that could still write something keeps its
+    rank in the hash. The graph the backend compiles is not touched.
+    """
+    try:
+        live = copy.deepcopy(graph)
+        for module in live.modules():
+            if isinstance(module, fx.GraphModule):
+                module.graph.eliminate_dead_code(is_impure_node=_keep_if_dead)
+                module.recompile()
+        return live
+    except Exception as e:
+        logger.warning(
+            "[TpuCompilerAdaptor] Fingerprinting the graph with its dead views: %s", e
+        )
+        return graph
+
+
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """Hash of the code of `graph` and its submodules and of their constants.
 
     Two ranks with the same fingerprint traced the same program, so either can
     replay the other's artifact. A rank-dependent value baked into the graph,
-    e.g. a Python int from `rank_in_group`, changes the code and so the hash.
-    None if the graph cannot be hashed; its artifact is then only replayed by
-    the rank that saved it.
+    e.g. a Python int from `rank_in_group`, changes the code and so the hash --
+    unless it only feeds a dead view (`_without_dead_views`), which is not in
+    the program. None if the graph cannot be hashed; its artifact is then only
+    replayed by the rank that saved it.
     """
     try:
+        graph = _without_dead_views(graph)
         h = hashlib.sha256()
         for name, module in graph.named_modules():
             if not isinstance(module, fx.GraphModule):
@@ -268,6 +311,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    # The HBM-streaming LM head op.
+    "vllm_torchtpu/layers/adapter/lm_head_hbm.py",
+    # The V-space DCP merge operand op (TPU_DCP_MERGE_VSPACE_FUSED).
+    "vllm_torchtpu/layers/adapter/dcp_vspace.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",

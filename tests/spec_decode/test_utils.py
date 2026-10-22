@@ -20,6 +20,14 @@ import torch
 from vllm_torchtpu.spec_decode import utils
 
 
+@pytest.fixture(autouse=True)
+def _gather_exchange(monkeypatch):
+    """These tests cover the all-gather exchange; TPU_MTP_ONEHOT_AR (on by
+    default) needs an initialized TP group and per-rank slots, and its tests
+    below build their slots explicitly."""
+    monkeypatch.setenv("TPU_MTP_ONEHOT_AR", "0")
+
+
 def test_own_vocab_weights_are_kept_when_tp_layout_matches():
     target_embed = object()
     target_head = object()
@@ -206,6 +214,81 @@ def test_vocab_parallel_argmax_matches_full_argmax(monkeypatch, tp, width, pad):
     for r in range(tp):
         out = utils.vocab_parallel_argmax(shards[r], infos[r])
         assert torch.equal(out, expected), (r, out, expected)
+
+
+def _simulated_all_reduce(per_rank_inputs):
+    """What the small all-reduce returns: float32 sum over ranks in rank
+    order, rounded once to the input dtype."""
+    acc = torch.zeros_like(per_rank_inputs[0], dtype=torch.float32)
+    for x in per_rank_inputs:
+        acc = acc + x.float()
+    return acc.to(per_rank_inputs[0].dtype)
+
+
+@pytest.mark.parametrize("tp,width,pad", [(16, 9680, 0), (4, 37, 5), (2, 8, 0)])
+def test_onehot_vocab_parallel_argmax_matches_full_argmax(monkeypatch, tp, width, pad):
+    """TPU_MTP_ONEHOT_AR: the (max, id) exchange as a one-hot all-reduce gives
+    the full-vocab torch.argmax, ties across and within shards included."""
+    import vllm.distributed as vd
+
+    rows = 16
+    g = torch.Generator().manual_seed(tp * 7 + width)
+    full = torch.randn(rows, tp * width, generator=g).to(torch.bfloat16)
+    org = tp * width - pad
+    full[0, :] = 1.0
+    full[1, width - 1] = full[1, width + 1] = 50.0
+    full[2, 3] = full[2, 5] = 50.0
+    full[4, :] = -0.0
+    full[4, width + 2] = 0.0  # signed zeros tie: lowest id wins
+    full[5, :] = -3.0
+    full[5, tp * width - pad - 1] = 7.0  # last real id (largest digits)
+    if pad:
+        full[3, org:] = 100.0
+    shards = list(full.split(width, dim=-1))
+    infos = [
+        utils.VocabParallelArgmax(
+            r * width,
+            max(0, min(width, org - r * width)),
+            tp,
+            slot=utils.rank_slot(r, tp, "cpu"),
+        )
+        for r in range(tp)
+    ]
+    bufs = []
+    monkeypatch.setattr(
+        vd, "tensor_model_parallel_all_reduce", lambda x: bufs.append(x) or x
+    )
+    for r in range(tp):
+        utils.vocab_parallel_argmax(shards[r], infos[r])
+    assert all(b.shape == (rows, tp * 128) and b.dtype == torch.bfloat16 for b in bufs)
+    summed = _simulated_all_reduce(bufs)
+    monkeypatch.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: summed)
+    masked = full.clone()
+    masked[:, org:] = float("-inf")
+    expected = torch.argmax(masked, dim=-1).to(torch.int32)
+    for r in range(tp):
+        out = utils.vocab_parallel_argmax(shards[r], infos[r])
+        assert out.dtype == torch.int32
+        assert torch.equal(out, expected), (r, out, expected)
+
+
+def test_onehot_all_gather_is_the_gather(monkeypatch):
+    """Each rank's block lands at its column slot, bitwise (bar -0)."""
+    import vllm.distributed as vd
+
+    tp, rows, n = 16, 4, 384
+    g = torch.Generator().manual_seed(3)
+    blocks = [
+        (torch.randn(rows, n, generator=g) * 1e3).to(torch.bfloat16) for _ in range(tp)
+    ]
+    bufs = []
+    monkeypatch.setattr(
+        vd, "tensor_model_parallel_all_reduce", lambda x: bufs.append(x) or x
+    )
+    for r in range(tp):
+        utils.onehot_all_gather(blocks[r], utils.rank_slot(r, tp, "cpu"))
+    out = _simulated_all_reduce(bufs)
+    assert torch.equal(out, torch.cat(blocks, dim=-1))
 
 
 @pytest.mark.parametrize(

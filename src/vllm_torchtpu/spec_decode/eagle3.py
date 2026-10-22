@@ -36,6 +36,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_lm_head,
     shard_draft_eh_proj,
     vocab_parallel_argmax,
+    with_device_vocab_start,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -230,6 +231,11 @@ class Eagle3Proposer:
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._vocab_parallel_argmax = None
         self._mtp_fused_loop_warm = False
+        # The token counts that program was compiled for (its loop buckets).
+        self._mtp_fused_loop_sizes: frozenset[int] | None = None
+        # Whether that program is the IndexShare variant, which takes each
+        # chunk's saved step-0 top-k rows and installs them in-graph.
+        self._mtp_fused_indexshare = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -301,20 +307,6 @@ class Eagle3Proposer:
                 tp_group.world_size,
                 n_eh,
             )
-        # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
-        # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
-        # The fused draft loop also argmaxes compute_logits; it keeps the
-        # full-logit path.
-        self._vocab_parallel_argmax = None
-        if (
-            envs.TPU_SAMPLER_VOCAB_PARALLEL
-            and not envs.VLLM_TPU_FUSED_DRAFT_LOOP
-            and getattr(self.draft_model, "draft_id_to_target_id", None) is None
-        ):
-            self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
-                self.draft_model
-            )
-            logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -338,6 +330,40 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+
+        # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
+        # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
+        # The plain fused draft loop argmaxes full logits, so it keeps the
+        # full-logit path: this is gated on that loop not being built (not on
+        # VLLM_TPU_FUSED_DRAFT_LOOP: under IndexShare the flag is on but
+        # without VLLM_TPU_MTP_FUSED_INDEXSHARE _build_mtp_fused_loop returns
+        # early, and every draft step runs _draft_propose_token). The
+        # IndexShare fused loop takes the shard argmax too, so both of its
+        # draft paths (step 0 here, steps 1.. in the program) agree.
+        self._vocab_parallel_argmax = None
+        if (
+            envs.TPU_SAMPLER_VOCAB_PARALLEL
+            and (self._mtp_fused_loop is None or self._mtp_fused_indexshare)
+            and getattr(self.draft_model, "draft_id_to_target_id", None) is None
+        ):
+            self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
+                self.draft_model
+            )
+            logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
+            if (
+                self._mtp_fused_loop is not None
+                and self._vocab_parallel_argmax is not None
+            ):
+                # Before its first call: the program traces lazily. The shard
+                # offset goes in as a device tensor, not a Python int: an int
+                # is baked into the graph, so every rank traced its own
+                # program and peer replay (TPU_PRECOMPILE_PEER_REPLAY) refused
+                # every other rank's artifact -- each rank compiled every
+                # bucket itself.
+                # pyrefly: ignore[bad-argument-type]
+                self._mtp_fused_loop.vocab_parallel_argmax = with_device_vocab_start(
+                    self._vocab_parallel_argmax, self.runner.device
+                )
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -553,18 +579,33 @@ class Eagle3Proposer:
         host dispatches once per propose for them instead of twice per step.
         Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
 
-        Only for the plain case: IndexShare restores top-k rows between steps
-        on the host, a draft->target id map would need its gather in the
-        program, and a cross-model KV-sharing draft (Gemma-4 MTP) keeps
-        positions and seq_lens fixed across steps where the program advances
-        them.
+        Not for a draft->target id map, which would need its gather in the
+        program, nor for a cross-model KV-sharing draft (Gemma-4 MTP), which
+        keeps positions and seq_lens fixed across steps where the program
+        advances them.
+
+        IndexShare (GLM-5.2 / DeepSeek-V3.2) gets its own variant with
+        `VLLM_TPU_MTP_FUSED_INDEXSHARE=1`. The per-step loop restores each
+        chunk's step-0 top-k rows before every step; the fused variant
+        restores them once, eagerly, right before the chunk's program, and the
+        program only reads the table: with skip_topk set no draft step writes
+        it (the MLA layer takes `topk_indices_buffer` as is), so every
+        unrolled step reads the rows the per-step loop would have restored.
+        Writing the rows into the table in-graph instead made the program
+        copy the whole [max_num_tokens, index_topk] table back on every call
+        (s32[4096, 2048], ~68 us/step on tpu7x). It needs the one 2-D table a
+        single nextn layer owns, and the loop-step program for the per-chunk
+        fallback; without either the per-step loop runs, which is
+        IndexShare-correct on its own.
         """
+        self._mtp_fused_loop = None
+        self._mtp_fused_loop_sizes = None
+        self._mtp_fused_indexshare = False
         draft_model = self.draft_model
         if (
             draft_model is None
             or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
             or self.speculative_config.method != "mtp"
-            or self._share_mtp_indices
             or not self.advance_draft_positions
             or getattr(draft_model, "draft_id_to_target_id", None) is not None
         ):
@@ -575,6 +616,46 @@ class Eagle3Proposer:
         K = self.speculative_config.num_speculative_tokens
         if K < 2:
             return
+        topk_indices_buffer = None
+        if self._share_mtp_indices:
+            if not envs.VLLM_TPU_MTP_FUSED_INDEXSHARE:
+                logger.info(
+                    "VLLM_TPU_MTP_FUSED_INDEXSHARE is off: IndexShare draft "
+                    "loop steps run one program each."
+                )
+                return
+            buffers = self._mtp_topk_buffers
+            if (
+                self._mtp_loop_model is None
+                or len(buffers) != 1
+                or buffers[0].ndim != 2
+            ):
+                logger.info(
+                    "The fused IndexShare loop needs exactly one 2-D top-k "
+                    "buffer and the loop-step program; this draft has %d "
+                    "buffer(s) %s and %s loop-step program. Draft loop steps "
+                    "run one program each.",
+                    len(buffers),
+                    [tuple(b.shape) for b in buffers],
+                    "a" if self._mtp_loop_model is not None else "no",
+                )
+                return
+            topk_indices_buffer = buffers[0]
+        indexshare = topk_indices_buffer is not None
+        # The program reads the table but never writes it: the rows are
+        # restored eagerly before each call (_run_mtp_fused_loop).
+        topk_indices_buffer = None
+        # The program only ever runs at a loop bucket p = pad(num_reqs) <=
+        # pad(max_num_reqs) (_run_mtp_fused_loop), so compile it at those
+        # buckets alone, not at every token bucket up to
+        # max_num_batched_tokens: two draft passes plus the LM head at 4096
+        # tokens is ~45 s of compile per bucket that no propose dispatches.
+        # Its own config copy, so the draft and loop-step programs keep theirs.
+        fused_vllm_config = copy.copy(self.draft_vllm_config)
+        fused_compilation_config = copy.copy(self.draft_vllm_config.compilation_config)
+        loop_sizes = self._loop_bucket_sizes()
+        fused_compilation_config.compile_sizes = list(loop_sizes)
+        fused_vllm_config.compilation_config = fused_compilation_config
         try:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
@@ -583,14 +664,21 @@ class Eagle3Proposer:
                 set_vllm_model_wrapper_context(
                     mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
                 ),
-                set_current_vllm_config(self.draft_vllm_config),
+                set_current_vllm_config(fused_vllm_config),
             ):
                 self._mtp_fused_loop = build_mtp_fused_loop(
-                    vllm_config=self.draft_vllm_config,
-                    prefix=f"mtp_fused_loop_k{K}",
+                    vllm_config=fused_vllm_config,
+                    # The variants trace different graphs: keep their compile
+                    # caches apart.
+                    prefix=(
+                        f"mtp_fused_loop_k{K}_indexshare"
+                        if indexshare
+                        else f"mtp_fused_loop_k{K}"
+                    ),
                     mtp=draft_model,
                     num_steps=K - 1,
                     dynamic_arg_dims=draft_dims,
+                    topk_indices_buffer=topk_indices_buffer,
                 )
         except Exception:
             logger.warning(
@@ -601,7 +689,48 @@ class Eagle3Proposer:
             self._mtp_fused_loop = None
             return
         self._mtp_fused_loop_warm = False
-        logger.info("MTP draft loop steps 1..%d run as one compiled program.", K - 1)
+        self._mtp_fused_loop_sizes = frozenset(loop_sizes)
+        self._mtp_fused_indexshare = indexshare
+        logger.info(
+            "Applied TPU patch: %s - MTP draft loop steps 1..%d run as one "
+            "compiled program%s.",
+            "MtpFusedLoop+IndexShare" if indexshare else "MtpFusedLoop",
+            K - 1,
+            " (each chunk's step-0 top-k rows restored before the program)"
+            if indexshare
+            else "",
+        )
+
+    def _loop_bucket_sizes(self) -> list[int]:
+        """Every loop bucket p a propose can pick: the token buckets up to
+        pad(max_num_reqs), which is what `_loop_bucket` returns at most."""
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        max_loop_bucket = _get_padded_token_len(
+            runner.num_tokens_paddings, runner.max_num_reqs
+        )
+        return sorted(
+            {self._loop_bucket(n) for n in runner.num_reqs_paddings}
+            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
+        )
+
+    def _shared_topk_rows_fit(
+        self, rows: torch.Tensor | None, input_ids: torch.Tensor
+    ) -> bool:
+        """Whether a chunk's saved top-k rows fit the IndexShare program: one
+        [index_topk] row per loop-bucket token, in the table's dtype, and no
+        more rows than the table holds. Anything else falls back to the
+        per-step loop, i.e. exactly the unfused IndexShare path."""
+        buf = self._mtp_topk_buffers[0]
+        return (
+            rows is not None
+            and rows.ndim == 2
+            and rows.shape[0] == input_ids.shape[0]
+            and rows.shape[0] <= buf.shape[0]
+            and rows.shape[1] == buf.shape[1]
+            and rows.dtype == buf.dtype
+        )
 
     def _run_mtp_fused_loop(
         self,
@@ -613,13 +742,26 @@ class Eagle3Proposer:
         num_rejected_dev: torch.Tensor | None,
         loop_query_start_loc: torch.Tensor,
         loop_request_distribution: torch.Tensor,
+        shared_topk_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...] | None:
         """Draft steps 1..K-1 of one chunk in one dispatch.
 
-        `input_ids` is step 0's token and `positions` step 1's. Returns the
-        K-1 tokens, or None when this chunk's metadata doesn't fit the
-        program (the caller then runs the per-step loop).
+        `input_ids` is step 0's token and `positions` step 1's. Under
+        IndexShare, `shared_topk_indices` is the chunk's saved step-0 top-k
+        rows, [p, index_topk], restored into the table right before the
+        program (which reads but never writes it). Returns the K-1 tokens, or
+        None when this chunk's metadata or rows don't fit the program (the
+        caller then runs the per-step loop, which restores on its own).
         """
+        if self._mtp_fused_indexshare:
+            if not self._shared_topk_rows_fit(shared_topk_indices, input_ids):
+                return None
+        elif shared_topk_indices is not None:
+            return None
+        sizes = self._mtp_fused_loop_sizes
+        if sizes is not None and input_ids.shape[0] not in sizes:
+            # Compiled at the loop buckets only (_build_mtp_fused_loop).
+            return None
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
             step_idx=1,
@@ -640,28 +782,61 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
-        with (
-            set_model_tag("eagle_head"),
-            set_forward_context(
-                attn_metadata,
-                self.draft_vllm_config,
-                num_tokens=num_tokens,
-                num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(num_tokens),
-            ),
-            set_vllm_model_wrapper_context(
-                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
-            ),
-        ):
-            if not self._mtp_fused_loop_warm:
-                # The first call traces and compiles; like the loop-step
-                # program's, its outputs can carry symbolic sizes, so run it
-                # again compiled. The repeat rewrites the same KV entries;
-                # seq_lens is put back first because the program advanced it.
-                seq_lens_step1 = seq_lens.clone()
-                self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
-                seq_lens.copy_(seq_lens_step1)
-                self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+        # Like the loop-step program, the IndexShare variant must reuse the
+        # installed rows rather than run the indexer, and its first trace
+        # bakes skip_topk in for good. A no-op without IndexShare.
+        # Strict try...finally ensures skip_topk never leaks to step 0.
+        self._mtp_set_skip_topk(True)
+        try:
+            with (
+                set_model_tag("eagle_head"),
+                set_forward_context(
+                    attn_metadata,
+                    self.draft_vllm_config,
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(
+                        num_tokens
+                    ),
+                ),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                ),
+            ):
+                # The caller hands in fresh clones (propose) or its own
+                # scratch (run_dp_dummy_draft); a second copy here would only
+                # add one eager copy program per input per propose.
+                input_ids_in = input_ids
+                positions_in = positions
+                hidden_states_in = hidden_states
+                if not self._mtp_fused_loop_warm:
+                    # The first call traces and compiles; like the loop-step
+                    # program's, its outputs can carry symbolic sizes, so run it
+                    # again compiled. The repeat rewrites the same KV entries;
+                    # seq_lens is put back first because the program advanced it.
+                    if shared_topk_indices is not None:
+                        self._mtp_restore_topk([shared_topk_indices])
+                    seq_lens_step1 = seq_lens.clone()
+                    self._mtp_fused_loop(
+                        input_ids_in.clone(),
+                        positions_in.clone(),
+                        hidden_states_in.clone(),
+                        seq_lens,
+                    )
+                    seq_lens.copy_(seq_lens_step1)
+                    self._mtp_fused_loop_warm = True
+                if shared_topk_indices is not None:
+                    # Eager, once per chunk, right before its program: the
+                    # unrolled steps all read these rows and none writes the
+                    # table.
+                    self._mtp_restore_topk([shared_topk_indices])
+                return self._mtp_fused_loop(
+                    input_ids_in,
+                    positions_in,
+                    hidden_states_in,
+                    seq_lens,
+                )
+        finally:
+            self._mtp_set_skip_topk(False)
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -671,13 +846,13 @@ class Eagle3Proposer:
         (indexer off). `skip_topk` is set before every call, but it only
         matters on each program's first run, when it gets baked in.
         """
-        assert self.draft_model is not None
-        loop_model = self._mtp_loop_model
-        if loop_model is None:
-            return self.draft_model
         loop_step = step_idx > 0
         self._mtp_set_skip_topk(loop_step)
-        return loop_model if loop_step else self.draft_model
+        if self._mtp_loop_model is None:
+            # pyrefly: ignore[bad-return]
+            return self.draft_model
+        # pyrefly: ignore[bad-return]
+        return self._mtp_loop_model if loop_step else self.draft_model
 
     def _mtp_set_skip_topk(self, skip: bool) -> None:
         if self._share_mtp_indices:
@@ -696,14 +871,54 @@ class Eagle3Proposer:
         write lands on exactly these rows and destroys them.
         """
         assert self.draft_model is not None
+        if envs.TPU_MTP_TOPK_INPLACE:
+            # The snapshot alone: every loop step restores these rows before
+            # it reads the table (separate path, fused program, and the fused
+            # path's per-chunk fallback), so the compaction write into the
+            # table would only be overwritten -- and on TPU it is a functional
+            # whole-table copy. Same rows: buf[:n] = buf[idx] then
+            # buf[:n].clone() equals buf[idx] (the right side is read first).
+            return [buf[gather_indices] for buf in self._mtp_topk_buffers]
         self.draft_model.model.compact_topk_indices(gather_indices)
         num_rows = gather_indices.shape[0]
         return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
 
+    def _topk_row_ids(self, n: int) -> torch.Tensor:
+        """Device int32 [0, n): the rows a restore writes (cached per n)."""
+        cache = self.__dict__.setdefault("_topk_row_ids_cache", {})
+        ids = cache.get(n)
+        if ids is None:
+            ids = torch.arange(n, dtype=torch.int32).to(self.runner.device)
+            cache[n] = ids
+        return ids
+
     def _mtp_restore_topk(self, saved: list[torch.Tensor]) -> None:
         """Put this chunk's step-0 rows back at the front before its forward."""
+        if envs.TPU_MTP_TOPK_INPLACE:
+            from vllm_torchtpu.kernels.partial_kv_update import pallas_index_copy_
+
+            for buf, rows in zip(self._mtp_topk_buffers, saved):
+                # In place, O(rows): the eager slice assignment below copies
+                # the whole table.
+                pallas_index_copy_(buf, self._topk_row_ids(rows.shape[0]), rows)
+            return
         for buf, rows in zip(self._mtp_topk_buffers, saved):
             buf[: rows.shape[0]] = rows
+
+    def _precompile_topk_restore(self) -> None:
+        """Warm the in-place restore at every loop bucket (TPU_MTP_TOPK_INPLACE),
+        so a propose never compiles it. Writes the rows the table already
+        holds, so its contents do not change."""
+        if not (envs.TPU_MTP_TOPK_INPLACE and self._share_mtp_indices):
+            return
+        runner = self.runner
+        sizes = self._loop_bucket_sizes()
+        with runner._precompile_timed("drafter top-k restore"):
+            for n in sizes:
+                saved = [buf[:n].clone() for buf in self._mtp_topk_buffers]
+                self._mtp_restore_topk(saved)
+                synchronize_tensors(list(self._mtp_topk_buffers))
+                logger.info("  -- drafter top-k restore rows: %d", n)
 
     def _validate_kv_sharing_supported(self) -> None:
         """Fail closed on TPU paths that cannot honour `skip_kv_update`.
@@ -1126,6 +1341,7 @@ class Eagle3Proposer:
         """
         runner = self.runner
         self._draft_md_cache.clear()
+        self._mtp_set_skip_topk(False)
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
             return []
@@ -1282,7 +1498,7 @@ class Eagle3Proposer:
             # rebuilding (with an H2D) on every one of the K-1 steps.
             loop_qsl_per_chunk = []
             loop_reqdist_per_chunk = []
-            for c in chunks:
+            for ci, c in enumerate(chunks):
                 knr = (
                     runner.num_reqs_max_model_len
                     if c.attn_ctx.use_max_model_len
@@ -1290,6 +1506,21 @@ class Eagle3Proposer:
                 )
                 assert knr is not None
                 qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
+                if envs.TPU_H2D_REUSE_STEADY:
+                    # Functions of (knr, num_reqs) only, read-only in the loop
+                    # draft programs: reuse the last upload while they repeat.
+                    loop_qsl_per_chunk.append(
+                        runner._upload_unless_unchanged(
+                            f"draft_loop_qsl_{ci}", torch.from_numpy(qsl_np)
+                        )
+                    )
+                    loop_reqdist_per_chunk.append(
+                        runner._upload_unless_unchanged(
+                            f"draft_loop_reqdist_{ci}",
+                            torch.tensor([c.num_reqs] * 3, dtype=torch.int32),
+                        )
+                    )
+                    continue
                 loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
                 loop_reqdist_per_chunk.append(
                     torch.tensor(
@@ -1324,27 +1555,44 @@ class Eagle3Proposer:
                     )
                 loop_hidden[ci] = hidden
 
-            if self._mtp_fused_loop is not None and not runner._dp_lockstep_enabled():
+            if (
+                self._mtp_fused_loop is not None
+                and self._mtp_fused_indexshare == self._share_mtp_indices
+                and not runner._dp_lockstep_enabled()
+            ):
                 # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
-                # is fine here: the separate path is step-major only for
-                # IndexShare's shared top-k buffer, which the fused program
-                # never runs with.
+                # is fine here even under IndexShare: the separate path is
+                # step-major only because the chunks share one top-k buffer,
+                # and _run_mtp_fused_loop restores the chunk's own saved rows
+                # right before its program, which only reads them.
                 for ci, chunk in enumerate(chunks):
                     fused = self._run_mtp_fused_loop(
                         chunk=chunk,
-                        input_ids=draft_tokens_per_chunk[ci][-1],
-                        positions=loop_positions[ci] + 1,
-                        hidden_states=loop_hidden[ci],
+                        input_ids=draft_tokens_per_chunk[ci][-1].clone(),
+                        positions=(loop_positions[ci] + 1).clone(),
+                        hidden_states=loop_hidden[ci].clone(),
                         num_rejected_np=rejected_np_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],
                         loop_query_start_loc=loop_qsl_per_chunk[ci],
                         loop_request_distribution=loop_reqdist_per_chunk[ci],
+                        # Restored into the table (copied), not consumed.
+                        shared_topk_indices=(
+                            saved_topk_per_chunk[ci][0]
+                            if self._mtp_fused_indexshare
+                            else None
+                        ),
                     )
                     if fused is not None:
                         draft_tokens_per_chunk[ci].extend(fused)
                         continue
-                    # This chunk's metadata doesn't fit the program.
+                    # This chunk's metadata (or top-k rows) doesn't fit the
+                    # program.
                     for step in range(1, K):
+                        if self._share_mtp_indices:
+                            # Chunk-major: the buffer holds another chunk's
+                            # rows (the last step 0's, or the previous
+                            # program's install). Same rule as below.
+                            self._mtp_restore_topk(saved_topk_per_chunk[ci])
                         run_draft_step(ci, step)
             else:
                 # Separate: one draft forward and one lm-head per step.
@@ -2002,6 +2250,7 @@ class Eagle3Proposer:
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
         self._precompile_compute_logits()
+        self._precompile_topk_restore()
 
     def _draft_hidden_size(self) -> int:
         """Width of the hidden state the draft's lm_head consumes.
@@ -2316,6 +2565,36 @@ class Eagle3Proposer:
             # programs, and the same collectives, as its peers. They read the
             # top-k table without having written it this step; load_model
             # seeds it with -1 so that read stays in range.
+            #
+            # propose() runs steps 1..K-1 as one fused program when one is
+            # built and the step is not DP-lockstepped; mirror that branch
+            # (same condition, same call-site copies) so a replay times the
+            # program the real propose runs. A real lockstep step never takes
+            # it (propose() checks the same condition), so lockstep peers are
+            # unaffected.
+            if (
+                self._mtp_fused_loop is not None
+                and self._mtp_fused_indexshare == self._share_mtp_indices
+                and not runner._dp_lockstep_enabled()
+            ):
+                fused = self._run_mtp_fused_loop(
+                    chunk=chunk,
+                    input_ids=loop_input_ids.clone(),
+                    positions=(loop_positions + 1).clone(),
+                    hidden_states=loop_hidden.clone(),
+                    num_rejected_np=None,
+                    num_rejected_dev=None,
+                    loop_query_start_loc=loop_qsl,
+                    loop_request_distribution=loop_reqdist,
+                    shared_topk_indices=(
+                        self._mtp_topk_buffers[0][:p].clone()
+                        if self._mtp_fused_indexshare
+                        else None
+                    ),
+                )
+                if fused is not None:
+                    synchronize_tensors(fused[-1])
+                    continue
             for step in range(1, K):
                 last_hidden, _ = self._forward_draft(
                     chunk=chunk,

@@ -574,3 +574,73 @@ def test_streamidx_block_sizes_mixed_kv_pages():
         (2, 2, STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP),
         (1, 128, 4),
     )
+
+
+def test_streamidx_block_sizes_decode_pack():
+    """TPU_STREAMIDX_DECODE_PACK picks the small-bucket kv block by bucket
+    (T <= 8: 32)."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP,
+        _streamidx_block_sizes,
+    )
+
+    def mixed_bkvp(t, bkvp=None, pack=True):
+        return _streamidx_block_sizes(t, 4, bkvp, 64, None, pack)[0][2]
+
+    assert [mixed_bkvp(t) for t in (4, 8, 16, 32, 64)] == [32, 32, 16, 16, 16]
+    # An explicit TPU_STREAMIDX_SMALL_BUCKET_BKVP wins; off keeps the default.
+    assert mixed_bkvp(4, bkvp=8) == 8
+    assert mixed_bkvp(4, pack=False) == STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    # Buckets past the small-bucket cap are untouched.
+    assert _streamidx_block_sizes(128, 4, None, 64, None, True) == (
+        (2, 2, 2),
+        (1, 128, 128),
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix, num_layers, expected",
+    [
+        ("model.layers.0.self_attn.indexer.k_cache", 78, False),
+        ("model.layers.77.self_attn.indexer.k_cache", 78, False),
+        ("model.layers.78.self_attn.indexer.k_cache", 78, True),  # GLM-5.2 MTP
+        ("model.layers.79.self_attn.indexer.k_cache", 78, True),
+        ("model.layers.3.self_attn.indexer.k_cache", 3, True),  # 3-layer twin
+        ("model.layers.78.self_attn.indexer.k_cache", None, False),
+        ("indexer.k_cache", 78, False),
+    ],
+)
+def test_is_draft_layer_prefix(prefix, num_layers, expected):
+    assert mla_attention_op._is_draft_layer_prefix(prefix, num_layers) is expected
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_streamidx_shared_meta_is_off_for_the_mtp_indexer(monkeypatch, flag):
+    """TPU_STREAMIDX_SHARED_META reaches the backbone's indexers only: the MTP
+    draft layer keeps the flag-off op (its q_len-1 DECODE schedule would
+    otherwise be built inside the skip-empty conditional)."""
+    monkeypatch.setenv("TPU_STREAMIDX_SHARED_META", "1" if flag else "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=78))
+    )
+    monkeypatch.setattr(
+        mla_attention_op, "get_current_vllm_config_or_none", lambda: config
+    )
+    target = mla_attention_op._streamidx_shared_meta_for(
+        "model.layers.14.self_attn.indexer.k_cache"
+    )
+    draft = mla_attention_op._streamidx_shared_meta_for(
+        "model.layers.78.self_attn.indexer.k_cache"
+    )
+    assert target is flag
+    assert draft is False
+    # No config (unit tests building a bare layer): the env alone decides.
+    monkeypatch.setattr(
+        mla_attention_op, "get_current_vllm_config_or_none", lambda: None
+    )
+    assert (
+        mla_attention_op._streamidx_shared_meta_for(
+            "model.layers.78.self_attn.indexer.k_cache"
+        )
+        is flag
+    )
